@@ -1,0 +1,29 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up FinTS Auto-Pay",
+        "description": "Configure your banking and notification settings.",
+        "data": {
+          "sensor": "Notification Sensor",
+          "notify": "Notify Service (e.g., notify.mobile_app_phone)",
+          "todo": "To-Do Entity",
+          "blz": "Bank Code (BLZ)",
+          "username": "Username",
+          "pin": "PIN",
+          "endpoint": "FinTS Endpoint URL",
+          "target_iban": "Target IBAN",
+          "recipient_name": "Recipient Name (as on your bank account)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect",
+      "invalid_auth": "Invalid authentication",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "Device is already configured"
+    }
+  }
+}
