@@ -7,6 +7,6 @@
   "documentation": "https://github.com/DatDraggy/wallet-auto-pay",
   "issue_tracker": "https://github.com/DatDraggy/wallet-auto-pay/issues",
   "iot_class": "local_push",
-  "requirements": ["qrcode==7.4.2", "Pillow==10.2.0"],
-  "version": "1.3.0"
+  "requirements": ["qrcode==7.4.2", "Pillow"],
+  "version": "1.3.1"
 }
