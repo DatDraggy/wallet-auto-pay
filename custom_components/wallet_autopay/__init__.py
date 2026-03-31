@@ -49,6 +49,13 @@ SERVICE_PAY_TODO_ITEM_SCHEMA = vol.Schema(
 )
 
 
+def get_giro_url(recipient: str, iban: str, amount: Decimal, merchant: str) -> str:
+    """Generate a pre-filled banking URI."""
+    encoded_recipient = urllib.parse.quote(recipient)
+    encoded_reason = urllib.parse.quote(f"Auto-Pay {merchant}")
+    return f"giro://x-callback-url/payment?name={encoded_recipient}&iban={iban}&amount={amount}&reason={encoded_reason}"
+
+
 async def async_add_to_todo(hass: HomeAssistant, entry_id: str, amount: Decimal, merchant: str) -> None:
     """Add a transaction to the auto-created To-Do list."""
     ent_reg = er.async_get(hass)
@@ -74,39 +81,39 @@ async def async_add_to_todo(hass: HomeAssistant, entry_id: str, amount: Decimal,
         _LOGGER.error("Failed to add to to-do list: %s", e)
 
 
-async def async_trigger_deep_link(hass: HomeAssistant, entry: ConfigEntry, amount: Decimal, merchant: str) -> None:
-    """Send the command_activity intent to the phone."""
-    dev_reg = dr.async_get(hass)
-    device = dev_reg.async_get(entry.data[CONF_DEVICE_ID])
-    if not device:
-        _LOGGER.error("Device not found for deep link.")
-        return
+async def async_send_payment_notification(
+    hass: HomeAssistant, 
+    notify_service: str, 
+    recipient: str, 
+    iban: str, 
+    amount: Decimal, 
+    merchant: str,
+    entry_id: str,
+    txn_id: str = None
+) -> None:
+    """Send a notification with a direct URI action button."""
+    giro_url = get_giro_url(recipient, iban, amount, merchant)
+    
+    # Use 'WALLET_TODO' for the callback if we have a txn_id
+    # If no txn_id (manual service call), we just provide the Pay button
+    actions = [{"action": "URI", "title": "Jetzt bezahlen", "uri": giro_url}]
+    
+    if txn_id:
+        actions.append({"action": f"{ACTION_ADD_TODO}::{entry_id}::{txn_id}", "title": "Später (To-Do)"})
 
-    notify_service = f"mobile_app_{device.name.lower().replace(' ', '_').replace('-', '_')}"
-    
-    recipient = urllib.parse.quote(entry.data[CONF_RECIPIENT_NAME])
-    iban = entry.data[CONF_TARGET_IBAN]
-    reason = urllib.parse.quote(f"Auto-Pay {merchant}")
-    
-    # Using a more robust Intent string format for Android
-    # This pre-fills 1822direkt/Sparkasse apps more reliably
-    intent_uri = (
-        f"intent://x-callback-url/payment?name={recipient}&iban={iban}&amount={amount}&reason={reason}"
-        f"#Intent;scheme=giro;package=de.fiducia.it.gic.android.direkt1822;end"
-    )
-    
     await hass.services.async_call(
         NOTIFY_DOMAIN,
         notify_service,
         {
-            "message": "command_activity",
+            "message": f"Wallet: {amount}€ bei {merchant}. Banking App öffnen?",
+            "title": "Wallet Auto-Pay",
             "data": {
-                "intent_action": "android.intent.action.VIEW",
-                "intent_uri": intent_uri,
+                "clickAction": giro_url, # Clicking the notification itself opens the app
+                "actions": actions,
                 "priority": "high",
                 "ttl": 0
-            }
-        }
+            },
+        },
     )
 
 
@@ -170,22 +177,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             async_call_later(hass, DEFAULT_FALLBACK_TIMEOUT, _fallback)
 
-            action_pay = f"{ACTION_PAY_NOW}::{entry.entry_id}::{txn_id}"
-            action_todo = f"{ACTION_ADD_TODO}::{entry.entry_id}::{txn_id}"
-
-            await hass.services.async_call(
-                NOTIFY_DOMAIN,
-                notify_service,
-                {
-                    "message": f"Google Wallet: {amount}€ at {merchant}. Open banking app?",
-                    "title": "Wallet Auto-Pay",
-                    "data": {
-                        "actions": [
-                            {"action": action_pay, "title": "Pay Now (Open App)"},
-                            {"action": action_todo, "title": "Add to To-Do"}
-                        ]
-                    },
-                },
+            await async_send_payment_notification(
+                hass, 
+                notify_service, 
+                entry.data[CONF_RECIPIENT_NAME],
+                entry.data[CONF_TARGET_IBAN],
+                amount,
+                merchant,
+                entry.entry_id,
+                txn_id
             )
 
     state_listener = async_track_state_change_event(hass, notification_sensor, _handle_state_change)
@@ -201,9 +201,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         pending = hass.data[DOMAIN][entry.entry_id]["pending"].pop(txn_id, None)
         if not pending: return
 
-        if act_type == ACTION_PAY_NOW:
-            await async_trigger_deep_link(hass, entry, pending["amount"], pending["merchant"])
-        elif act_type == ACTION_ADD_TODO:
+        if act_type == ACTION_ADD_TODO:
             await async_add_to_todo(hass, entry.entry_id, pending["amount"], pending["merchant"])
 
     action_listener = hass.bus.async_listen(EVENT_MOBILE_APP_NOTIFICATION_ACTION, _handle_action)
@@ -211,35 +209,49 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register services
     async def handle_pay_transaction(call: ServiceCall) -> None:
-        """Service to trigger a payment deep link manually."""
+        """Service to trigger a payment notification manually."""
         amount = call.data["amount"]
         merchant = call.data["merchant"]
         call_entry_id = call.data.get("entry_id", entry.entry_id)
         target_entry = hass.config_entries.async_get_entry(call_entry_id)
         if target_entry:
-            await async_trigger_deep_link(hass, target_entry, amount, merchant)
+            await async_send_payment_notification(
+                hass, 
+                hass.data[DOMAIN][target_entry.entry_id]["notify"],
+                target_entry.data[CONF_RECIPIENT_NAME],
+                target_entry.data[CONF_TARGET_IBAN],
+                amount,
+                merchant,
+                target_entry.entry_id
+            )
 
     async def handle_pay_todo_item(call: ServiceCall) -> None:
-        """Service to parse a To-Do item and trigger payment."""
+        """Service to parse a To-Do item and trigger payment notification."""
         entity_id = call.data["entity_id"]
         item_name = call.data["item_name"]
         
-        # Regex to parse our format: "Pay 12.34€ for Starbucks"
         match = re.search(r"Pay\s+(\d+(?:[.,]\d{1,2})?)€\s+for\s+(.+)", item_name, re.I)
         if not match:
-            _LOGGER.error("Could not parse To-Do item: %s. Expected format 'Pay 12.34€ for Merchant'", item_name)
+            _LOGGER.error("Could not parse To-Do item: %s", item_name)
             return
 
         amount = Decimal(match.group(1).replace(",", "."))
         merchant = match.group(2).strip()
         
-        # Find entry for this todo list to get correct banking info
         ent_reg = er.async_get(hass)
         entity_entry = ent_reg.async_get(entity_id)
         if entity_entry and entity_entry.config_entry_id:
             config_entry = hass.config_entries.async_get_entry(entity_entry.config_entry_id)
             if config_entry:
-                await async_trigger_deep_link(hass, config_entry, amount, merchant)
+                await async_send_payment_notification(
+                    hass, 
+                    hass.data[DOMAIN][config_entry.entry_id]["notify"],
+                    config_entry.data[CONF_RECIPIENT_NAME],
+                    config_entry.data[CONF_TARGET_IBAN],
+                    amount,
+                    merchant,
+                    config_entry.entry_id
+                )
 
     hass.services.async_register(DOMAIN, "pay_transaction", handle_pay_transaction, schema=SERVICE_PAY_TRANSACTION_SCHEMA)
     hass.services.async_register(DOMAIN, "pay_todo_item", handle_pay_todo_item, schema=SERVICE_PAY_TODO_ITEM_SCHEMA)
