@@ -9,7 +9,6 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResult
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import selector
 
 from fints.client import FinTS3PinTanClient
@@ -17,9 +16,7 @@ from fints.exceptions import FinTSError
 
 from .const import (
     DOMAIN,
-    CONF_SENSOR,
-    CONF_NOTIFY,
-    CONF_TODO,
+    CONF_DEVICE_ID,
     CONF_BLZ,
     CONF_USERNAME,
     CONF_PIN,
@@ -32,14 +29,8 @@ _LOGGER = logging.getLogger(__name__)
 
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
-        vol.Required(CONF_SENSOR): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain="sensor")
-        ),
-        vol.Required(CONF_NOTIFY): selector.TextSelector(
-            selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT)
-        ),
-        vol.Required(CONF_TODO): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain="todo")
+        vol.Required(CONF_DEVICE_ID): selector.DeviceSelector(
+            selector.DeviceSelectorConfig(integration="mobile_app")
         ),
         vol.Required(CONF_BLZ): selector.TextSelector(
             selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT)
@@ -64,7 +55,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 
 
 def validate_fints_login(blz: str, username: str, pin: str, endpoint: str) -> None:
-    """Validate FinTS credentials by fetching accounts. This will trigger a login attempt."""
+    """Validate FinTS credentials."""
     client = FinTS3PinTanClient(blz, username, pin, endpoint)
     with client:
         client.get_sepa_accounts()
@@ -83,7 +74,6 @@ class FintsAutoPayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             try:
-                # We need to run the blocking validate_fints_login in an executor
                 await self.hass.async_add_executor_job(
                     validate_fints_login,
                     user_input[CONF_BLZ],
@@ -92,14 +82,14 @@ class FintsAutoPayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     user_input[CONF_ENDPOINT],
                 )
             except FinTSError as err:
-                _LOGGER.error("FinTS Error validating credentials: %s", err)
+                _LOGGER.error("FinTS Error: %s", err)
                 errors["base"] = "invalid_auth"
             except Exception as err:
-                _LOGGER.error("Unexpected error validating FinTS credentials: %s", err)
+                _LOGGER.error("Unexpected error: %s", err)
                 errors["base"] = "unknown"
             else:
                 return self.async_create_entry(
-                    title=user_input[CONF_USERNAME], data=user_input
+                    title=f"FinTS Pay: {user_input[CONF_USERNAME]}", data=user_input
                 )
 
         return self.async_show_form(

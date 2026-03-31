@@ -3,17 +3,15 @@
     "step": {
       "user": {
         "title": "Set up FinTS Auto-Pay",
-        "description": "Configure your banking and notification settings.",
+        "description": "Select the mobile device running the Home Assistant Companion App and enter your banking details.",
         "data": {
-          "sensor": "Notification Sensor",
-          "notify": "Notify Service (e.g., notify.mobile_app_phone)",
-          "todo": "To-Do Entity",
+          "device_id": "Phone / Mobile Device",
           "blz": "Bank Code (BLZ)",
-          "username": "Username",
-          "pin": "PIN",
+          "username": "Banking Username",
+          "pin": "Banking PIN",
           "endpoint": "FinTS Endpoint URL",
-          "target_iban": "Target IBAN",
-          "recipient_name": "Recipient Name (as on your bank account)"
+          "target_iban": "Target IBAN (Credit Card)",
+          "recipient_name": "Recipient Name (as on Bank Account)"
         }
       }
     },

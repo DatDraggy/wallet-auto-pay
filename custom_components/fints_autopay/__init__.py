@@ -5,20 +5,21 @@ import logging
 import re
 import uuid
 from decimal import Decimal
+from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, State
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers.event import async_track_state_change_event, async_call_later
 from homeassistant.components.notify import DOMAIN as NOTIFY_DOMAIN
+from homeassistant.const import Platform
 
 from fints.client import FinTS3PinTanClient
 from fints.exceptions import FinTSError
 
 from .const import (
     DOMAIN,
-    CONF_SENSOR,
-    CONF_NOTIFY,
-    CONF_TODO,
+    CONF_DEVICE_ID,
     CONF_BLZ,
     CONF_USERNAME,
     CONF_PIN,
@@ -27,39 +28,40 @@ from .const import (
     CONF_RECIPIENT_NAME,
 )
 
-import asyncio
-from datetime import timedelta
-from homeassistant.helpers.event import async_call_later
-
 _LOGGER = logging.getLogger(__name__)
 
+PLATFORMS: list[Platform] = [Platform.TODO]
 EVENT_MOBILE_APP_NOTIFICATION_ACTION = "mobile_app_notification_action"
 ACTION_PAY_NOW = "FINTS_PAY"
 ACTION_ADD_TODO = "FINTS_TODO"
-DEFAULT_FALLBACK_TIMEOUT = 3600  # 1 hour
+DEFAULT_FALLBACK_TIMEOUT = 3600
 
 
 async def async_add_to_todo(hass: HomeAssistant, entry_id: str, amount: Decimal, merchant: str) -> None:
-    """Add a transaction to the configured To-Do list."""
-    # We need to find the entry to get the todo_entity
-    entry = hass.config_entries.async_get_entry(entry_id)
-    if not entry:
-        return
+    """Add a transaction to the auto-created To-Do list."""
+    todo_entity = f"todo.fints_auto_pay_{entry_id.replace('-', '_')}" # Fallback guess if registry lookup fails
     
-    todo_entity = entry.data[CONF_TODO]
+    # Try to find the actual entity_id from the registry
+    ent_reg = er.async_get(hass)
+    entities = er.async_entries_for_config_entry(ent_reg, entry_id)
+    for entity in entities:
+        if entity.domain == "todo":
+            todo_entity = entity.entity_id
+            break
+
     try:
         await hass.services.async_call(
             "todo",
             "add_item",
             {"entity_id": todo_entity, "item": f"Pay {amount}€ for {merchant}"},
         )
-        _LOGGER.info("Automatically added %s€ for %s to To-Do list (fallback)", amount, merchant)
+        _LOGGER.info("Fallback: Transaction for %s added to to-do list.", merchant)
     except Exception as e:
-        _LOGGER.error("Fallback: Adding to todo list failed: %s", e)
+        _LOGGER.error("Failed to add to to-do list: %s", e)
 
 
 def execute_fints_transfer(config_data: dict, amount: Decimal, merchant: str) -> None:
-    """Execute a synchronous SEPA transfer via FinTS."""
+    """Execute SEPA transfer via FinTS."""
     client = FinTS3PinTanClient(
         config_data[CONF_BLZ],
         config_data[CONF_USERNAME],
@@ -70,11 +72,9 @@ def execute_fints_transfer(config_data: dict, amount: Decimal, merchant: str) ->
     with client:
         accounts = client.get_sepa_accounts()
         if not accounts:
-            raise ValueError("No SEPA accounts found to send money from.")
+            raise ValueError("No SEPA accounts found.")
 
-        # Pick the first account as the source
         account = accounts[0]
-
         client.simple_sepa_transfer(
             account=account,
             iban=config_data[CONF_TARGET_IBAN],
@@ -89,130 +89,106 @@ def execute_fints_transfer(config_data: dict, amount: Decimal, merchant: str) ->
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up FinTS Auto-Pay from a config entry."""
     hass.data.setdefault(DOMAIN, {})
+    
+    # Find the Last Notification sensor for this device
+    ent_reg = er.async_get(hass)
+    device_id = entry.data[CONF_DEVICE_ID]
+    
+    notification_sensor = None
+    entities = er.async_entries_for_device(ent_reg, device_id)
+    for ent in entities:
+        if ent.domain == "sensor" and ent.original_name == "Last Notification":
+            notification_sensor = ent.entity_id
+            break
+            
+    if not notification_sensor:
+        _LOGGER.error("Could not find 'Last Notification' sensor for the selected device.")
+        return False
+
+    # Derive notify service from device registry
+    dev_reg = dr.async_get(hass)
+    device = dev_reg.async_get(device_id)
+    if not device:
+        _LOGGER.error("Selected device no longer exists.")
+        return False
+        
+    # The mobile_app integration usually names the notify service: notify.mobile_app_<slugified_device_name>
+    # We can try to find it via the companion app's naming convention
+    device_name_slug = dr.format_mac(device.name).replace(":", "_").lower() if not device.name else "unknown"
+    # A more reliable way is to look at the 'mobile_app' notify services directly
+    notify_service = f"mobile_app_{device.name.lower().replace(' ', '_').replace('-', '_')}"
+
     hass.data[DOMAIN][entry.entry_id] = {
         "pending": {},
         "listeners": [],
+        "sensor": notification_sensor,
+        "notify": notify_service,
     }
 
-    notification_sensor = entry.data[CONF_SENSOR]
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     async def _handle_state_change(event: Event) -> None:
-        """Handle state changes of the notification sensor."""
         new_state = event.data.get("new_state")
-        if not new_state:
+        if not new_state or new_state.attributes.get("package") != "com.google.android.apps.walletnfcrel":
             return
 
-        attributes = new_state.attributes
-        package = attributes.get("package")
-        if package != "com.google.android.apps.walletnfcrel":
-            return
-
-        android_text = attributes.get("android.text", "")
-        # Common Google Wallet text: "Paid € 12.34 at Starbucks" or "12,34 € bei Rewe"
-        match = re.search(
-            r"(?:€|EUR)?\s*(\d+(?:[.,]\d{1,2})?)\s*(?:€|EUR)?\s*(?:at|bei)\s+(.+)",
-            android_text,
-            re.IGNORECASE,
-        )
+        text = new_state.attributes.get("android.text", "")
+        match = re.search(r"(?:€|EUR)?\s*(\d+(?:[.,]\d{1,2})?)\s*(?:€|EUR)?\s*(?:at|bei)\s+(.+)", text, re.I)
         if match:
-            amount_str = match.group(1).replace(",", ".")
+            amount = Decimal(match.group(1).replace(",", "."))
             merchant = match.group(2).strip()
-            amount = Decimal(amount_str)
-
             txn_id = uuid.uuid4().hex
-            hass.data[DOMAIN][entry.entry_id]["pending"][txn_id] = {
-                "amount": amount,
-                "merchant": merchant,
-            }
+            
+            hass.data[DOMAIN][entry.entry_id]["pending"][txn_id] = {"amount": amount, "merchant": merchant}
 
-            async def _fallback_to_todo(_now):
-                """Fallback if no action taken."""
+            async def _fallback(_now):
                 pending = hass.data[DOMAIN][entry.entry_id]["pending"].pop(txn_id, None)
                 if pending:
                     await async_add_to_todo(hass, entry.entry_id, pending["amount"], pending["merchant"])
 
-            async_call_later(hass, DEFAULT_FALLBACK_TIMEOUT, _fallback_to_todo)
-
-            notify_service = entry.data[CONF_NOTIFY]
-            domain_service = notify_service.split(".", 1)
-
-            if len(domain_service) == 2:
-                svc_domain, svc_name = domain_service
-            else:
-                svc_domain, svc_name = NOTIFY_DOMAIN, notify_service
+            async_call_later(hass, DEFAULT_FALLBACK_TIMEOUT, _fallback)
 
             action_pay = f"{ACTION_PAY_NOW}::{entry.entry_id}::{txn_id}"
             action_todo = f"{ACTION_ADD_TODO}::{entry.entry_id}::{txn_id}"
 
             await hass.services.async_call(
-                svc_domain,
-                svc_name,
+                NOTIFY_DOMAIN,
+                notify_service,
                 {
-                    "message": f"Google Wallet: {amount}€ at {merchant}. Pay now from checking?",
+                    "message": f"Google Wallet: {amount}€ at {merchant}. Pay now?",
                     "title": "FinTS Auto-Pay",
                     "data": {
                         "actions": [
                             {"action": action_pay, "title": "Pay Now"},
-                            {"action": action_todo, "title": "Add to To-Do List"},
+                            {"action": action_todo, "title": "Add to To-Do"}
                         ]
                     },
                 },
             )
 
-    state_listener = async_track_state_change_event(
-        hass, notification_sensor, _handle_state_change
-    )
+    state_listener = async_track_state_change_event(hass, notification_sensor, _handle_state_change)
     hass.data[DOMAIN][entry.entry_id]["listeners"].append(state_listener)
 
-    async def _handle_notification_action(event: Event) -> None:
-        """Handle actionable notification button presses."""
+    async def _handle_action(event: Event) -> None:
         action = event.data.get("action", "")
+        if "::" not in action: return
+        
+        act_type, ent_id, txn_id = action.split("::")
+        if ent_id != entry.entry_id: return
 
-        if action.startswith(ACTION_PAY_NOW) or action.startswith(ACTION_ADD_TODO):
-            parts = action.split("::")
-            if len(parts) < 3:
-                return
+        pending = hass.data[DOMAIN][entry.entry_id]["pending"].pop(txn_id, None)
+        if not pending: return
 
-            txn_id = parts[-1]
-            entry_id = parts[-2]
+        if act_type == ACTION_PAY_NOW:
+            try:
+                await hass.async_add_executor_job(execute_fints_transfer, entry.data, pending["amount"], pending["merchant"])
+                _LOGGER.info("Payment successful.")
+            except Exception as e:
+                _LOGGER.error("Payment failed: %s", e)
+        elif act_type == ACTION_ADD_TODO:
+            await async_add_to_todo(hass, entry.entry_id, pending["amount"], pending["merchant"])
 
-            if entry_id != entry.entry_id:
-                return
-
-            pending = hass.data[DOMAIN][entry.entry_id]["pending"].pop(txn_id, None)
-            if not pending:
-                _LOGGER.warning("Transaction %s not found or already processed", txn_id)
-                return
-
-            amount = pending["amount"]
-            merchant = pending["merchant"]
-
-            if action.startswith(ACTION_PAY_NOW):
-                try:
-                    _LOGGER.info(
-                        "Executing FinTS transfer for %s€ to %s", amount, merchant
-                    )
-                    await hass.async_add_executor_job(
-                        execute_fints_transfer, entry.data, amount, merchant
-                    )
-                    _LOGGER.info("Transfer successful!")
-                except Exception as e:
-                    _LOGGER.error("Transfer failed: %s", e)
-
-            elif action.startswith(ACTION_ADD_TODO):
-                todo_entity = entry.data[CONF_TODO]
-                try:
-                    await hass.services.async_call(
-                        "todo",
-                        "add_item",
-                        {"entity_id": todo_entity, "item": f"Pay {amount}€ for {merchant}"},
-                    )
-                except Exception as e:
-                    _LOGGER.error("Adding to todo list failed: %s", e)
-
-    action_listener = hass.bus.async_listen(
-        EVENT_MOBILE_APP_NOTIFICATION_ACTION, _handle_notification_action
-    )
+    action_listener = hass.bus.async_listen(EVENT_MOBILE_APP_NOTIFICATION_ACTION, _handle_action)
     hass.data[DOMAIN][entry.entry_id]["listeners"].append(action_listener)
 
     return True
@@ -220,9 +196,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    for listener in hass.data[DOMAIN][entry.entry_id]["listeners"]:
-        # Unsubscribe listener
-        listener()
-
-    hass.data[DOMAIN].pop(entry.entry_id)
-    return True
+    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        for listener in hass.data[DOMAIN][entry.entry_id]["listeners"]:
+            listener()
+        hass.data[DOMAIN].pop(entry.entry_id)
+    return unload_ok
