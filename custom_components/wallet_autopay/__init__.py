@@ -41,6 +41,13 @@ SERVICE_PAY_TRANSACTION_SCHEMA = vol.Schema(
     }
 )
 
+SERVICE_PAY_TODO_ITEM_SCHEMA = vol.Schema(
+    {
+        vol.Required("entity_id"): cv.entity_id,
+        vol.Required("item_name"): cv.string,
+    }
+)
+
 
 async def async_add_to_todo(hass: HomeAssistant, entry_id: str, amount: Decimal, merchant: str) -> None:
     """Add a transaction to the auto-created To-Do list."""
@@ -81,8 +88,12 @@ async def async_trigger_deep_link(hass: HomeAssistant, entry: ConfigEntry, amoun
     iban = entry.data[CONF_TARGET_IBAN]
     reason = urllib.parse.quote(f"Auto-Pay {merchant}")
     
-    # GIRO URL Scheme
-    giro_url = f"giro://x-callback-url/payment?name={recipient}&iban={iban}&amount={amount}&reason={reason}"
+    # Using a more robust Intent string format for Android
+    # This pre-fills 1822direkt/Sparkasse apps more reliably
+    intent_uri = (
+        f"intent://x-callback-url/payment?name={recipient}&iban={iban}&amount={amount}&reason={reason}"
+        f"#Intent;scheme=giro;package=de.fiducia.it.gic.android.direkt1822;end"
+    )
     
     await hass.services.async_call(
         NOTIFY_DOMAIN,
@@ -91,8 +102,7 @@ async def async_trigger_deep_link(hass: HomeAssistant, entry: ConfigEntry, amoun
             "message": "command_activity",
             "data": {
                 "intent_action": "android.intent.action.VIEW",
-                "intent_uri": giro_url,
-                "intent_package": "de.fiducia.it.gic.android.direkt1822",
+                "intent_uri": intent_uri,
                 "priority": "high",
                 "ttl": 0
             }
@@ -110,7 +120,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     notification_sensor = None
     entities = er.async_entries_for_device(ent_reg, device_id)
     for ent in entities:
-        # Very aggressive check: domain sensor + 'last_notification' anywhere in ID or name
         if ent.domain == "sensor" and (
             "last_notification" in ent.entity_id or 
             "last_notification" in (ent.unique_id or "").lower() or
@@ -120,18 +129,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             break
             
     if not notification_sensor:
-        _LOGGER.error(
-            "Could not find 'Last Notification' sensor for device %s. "
-            "Available entities on device: %s",
-            device_id,
-            [e.entity_id for e in entities]
-        )
+        _LOGGER.error("Could not find 'Last Notification' sensor for device %s.", device_id)
         return False
 
-    # Derive notify service from the sensor name
-    # e.g. sensor.pixel_9_pro_xl_last_notification -> mobile_app_pixel_9_pro_xl
-    device_slug = notification_sensor.replace("sensor.", "").replace("_last_notification", "")
-    notify_service = f"mobile_app_{device_slug}"
+    dev_reg = dr.async_get(hass)
+    device = dev_reg.async_get(device_id)
+    if not device:
+        _LOGGER.error("Selected device no longer exists.")
+        return False
+        
+    notify_service = f"mobile_app_{device.name.lower().replace(' ', '_').replace('-', '_')}"
 
     hass.data[DOMAIN][entry.entry_id] = {
         "pending": {},
@@ -208,14 +215,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         amount = call.data["amount"]
         merchant = call.data["merchant"]
         call_entry_id = call.data.get("entry_id", entry.entry_id)
-        
         target_entry = hass.config_entries.async_get_entry(call_entry_id)
         if target_entry:
             await async_trigger_deep_link(hass, target_entry, amount, merchant)
 
-    hass.services.async_register(
-        DOMAIN, "pay_transaction", handle_pay_transaction, schema=SERVICE_PAY_TRANSACTION_SCHEMA
-    )
+    async def handle_pay_todo_item(call: ServiceCall) -> None:
+        """Service to parse a To-Do item and trigger payment."""
+        entity_id = call.data["entity_id"]
+        item_name = call.data["item_name"]
+        
+        # Regex to parse our format: "Pay 12.34€ for Starbucks"
+        match = re.search(r"Pay\s+(\d+(?:[.,]\d{1,2})?)€\s+for\s+(.+)", item_name, re.I)
+        if not match:
+            _LOGGER.error("Could not parse To-Do item: %s. Expected format 'Pay 12.34€ for Merchant'", item_name)
+            return
+
+        amount = Decimal(match.group(1).replace(",", "."))
+        merchant = match.group(2).strip()
+        
+        # Find entry for this todo list to get correct banking info
+        ent_reg = er.async_get(hass)
+        entity_entry = ent_reg.async_get(entity_id)
+        if entity_entry and entity_entry.config_entry_id:
+            config_entry = hass.config_entries.async_get_entry(entity_entry.config_entry_id)
+            if config_entry:
+                await async_trigger_deep_link(hass, config_entry, amount, merchant)
+
+    hass.services.async_register(DOMAIN, "pay_transaction", handle_pay_transaction, schema=SERVICE_PAY_TRANSACTION_SCHEMA)
+    hass.services.async_register(DOMAIN, "pay_todo_item", handle_pay_todo_item, schema=SERVICE_PAY_TODO_ITEM_SCHEMA)
 
     return True
 
@@ -227,8 +254,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             listener()
         hass.data[DOMAIN].pop(entry.entry_id)
         
-        # Unregister service if no entries left
         if not hass.data[DOMAIN]:
             hass.services.async_remove(DOMAIN, "pay_transaction")
+            hass.services.async_remove(DOMAIN, "pay_todo_item")
             
     return unload_ok
