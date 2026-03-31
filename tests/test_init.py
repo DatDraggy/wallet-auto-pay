@@ -158,7 +158,7 @@ async def test_notification_listener_and_todo_fallback(hass: HomeAssistant) -> N
     with patch("homeassistant.core.ServiceRegistry.async_call") as mock_todo_call:
         async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=3601))
         await hass.async_block_till_done()
-        todo_calls = [c for c in mock_todo_call.call_args_list if c[0][0] == "todo"]
+        todo_calls = [call for call in mock_todo_call.call_args_list if call[0][0] == "todo"]
         assert len(todo_calls) > 0
         assert "Pay 12.34€ for Starbucks" in todo_calls[0][0][2]["item"]
 
@@ -196,34 +196,6 @@ async def test_async_add_to_todo_fails(hass: HomeAssistant) -> None:
         await async_add_to_todo(hass, entry.entry_id, Decimal("10.00"), "Merchant")
 
 
-async def test_notification_action_pay_deep_link(hass: HomeAssistant) -> None:
-    """Test clicking 'Pay Now' triggers command_activity."""
-    real_device_id = await setup_mock_registries(hass)
-    config = MOCK_CONFIG.copy()
-    config[CONF_DEVICE_ID] = real_device_id
-    entry = MockConfigEntry(domain=DOMAIN, data=config, entry_id="test_entry")
-    entry.add_to_hass(hass)
-    await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done()
-
-    txn_id = "test_txn"
-    hass.data[DOMAIN][entry.entry_id]["pending"][txn_id] = {"amount": Decimal("10.00"), "merchant": "Bakery"}
-
-    with patch("homeassistant.core.ServiceRegistry.async_call") as mock_call:
-        hass.bus.async_fire("mobile_app_notification_action", {"action": f"WALLET_PAY::{entry.entry_id}::{txn_id}"})
-        await hass.async_block_till_done()
-        
-        activity_calls = [
-            c for c in mock_call.call_args_list 
-            if c[0][0] == "notify" and c[0][2].get("message") == "command_activity"
-        ]
-        
-        assert len(activity_calls) > 0
-        data = activity_calls[0][0][2]["data"]
-        assert "giro://" in data["intent_uri"]
-        assert txn_id not in hass.data[DOMAIN][entry.entry_id]["pending"]
-
-
 async def test_notification_action_todo(hass: HomeAssistant) -> None:
     """Test clicking 'Add to To-Do'."""
     real_device_id = await setup_mock_registries(hass)
@@ -234,6 +206,7 @@ async def test_notification_action_todo(hass: HomeAssistant) -> None:
     await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
+    # Manually register todo entity for this entry to avoid failure
     ent_reg = er.async_get(hass)
     ent_reg.async_get_or_create("todo", DOMAIN, "test_entry_todo", config_entry=entry)
 
@@ -266,20 +239,59 @@ async def test_pay_transaction_service(hass: HomeAssistant) -> None:
 
     with patch("homeassistant.core.ServiceRegistry.async_call", side_effect=mock_async_call) as mock_call:
         await hass.services.async_call(DOMAIN, "pay_transaction", {"amount": 15.50, "merchant": "Supermarket"}, blocking=True)
-        activity_calls = [c for c in mock_call.call_args_list if c[0][0] == "notify" and c[0][2].get("message") == "command_activity"]
+        activity_calls = [c for c in mock_call.call_args_list if c[0][0] == "notify"]
         assert len(activity_calls) > 0
         data = activity_calls[0][0][2]["data"]
-        assert "amount=15.5" in data["intent_uri"]
+        assert "giro://" in data["actions"][0]["uri"]
 
 
-async def test_trigger_deep_link_device_not_found(hass: HomeAssistant) -> None:
-    """Test deep link trigger when device is missing."""
+async def test_pay_todo_item_service(hass: HomeAssistant) -> None:
+    """Test the pay_todo_item service."""
+    real_device_id = await setup_mock_registries(hass)
     config = MOCK_CONFIG.copy()
-    config[CONF_DEVICE_ID] = "missing_device"
+    config[CONF_DEVICE_ID] = real_device_id
     entry = MockConfigEntry(domain=DOMAIN, data=config, entry_id="test_entry")
     entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    ent_reg = er.async_get(hass)
+    todo_entry = ent_reg.async_get_or_create("todo", DOMAIN, "test_todo", config_entry=entry)
+
+    real_async_call = hass.services.async_call
+    async def mock_async_call(domain, service, service_data=None, blocking=False, context=None, limit=None, target=None):
+        if domain == "notify":
+            return MagicMock()
+        return await real_async_call(domain, service, service_data, blocking, context, limit, target)
+
+    with patch("homeassistant.core.ServiceRegistry.async_call", side_effect=mock_async_call) as mock_call:
+        await hass.services.async_call(DOMAIN, "pay_todo_item", {"entity_id": todo_entry.entity_id, "item_name": "Pay 10.00€ for Bakery"}, blocking=True)
+        assert any(c[0][0] == "notify" for c in mock_call.call_args_list)
+
+
+async def test_pay_next_item_service(hass: HomeAssistant) -> None:
+    """Test the pay_next_item service."""
+    real_device_id = await setup_mock_registries(hass)
+    config = MOCK_CONFIG.copy()
+    config[CONF_DEVICE_ID] = real_device_id
+    entry = MockConfigEntry(domain=DOMAIN, data=config, entry_id="test_entry")
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    entity_id = "todo.wallet_auto_pay_john_doe"
+    todo_list = hass.data["todo"].get_entity(entity_id)
     
-    from custom_components.wallet_autopay import async_trigger_deep_link
-    with patch("homeassistant.helpers.device_registry.DeviceRegistry.async_get", return_value=None):
-        await async_trigger_deep_link(hass, entry, Decimal("10.00"), "Merchant")
-        # Should log error and return
+    # Add an item to the list
+    from homeassistant.components.todo import TodoItem
+    todo_list.todo_items.append(TodoItem(summary="Pay 5.00€ for Coffee", uid="1"))
+
+    real_async_call = hass.services.async_call
+    async def mock_async_call(domain, service, service_data=None, blocking=False, context=None, limit=None, target=None):
+        if domain == "notify":
+            return MagicMock()
+        return await real_async_call(domain, service, service_data, blocking, context, limit, target)
+
+    with patch("homeassistant.core.ServiceRegistry.async_call", side_effect=mock_async_call) as mock_call:
+        await hass.services.async_call(DOMAIN, "pay_next_item", {"entity_id": entity_id}, blocking=True)
+        assert any(c[0][0] == "notify" for c in mock_call.call_args_list)

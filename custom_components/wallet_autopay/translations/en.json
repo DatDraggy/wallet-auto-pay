@@ -7,7 +7,8 @@
         "data": {
           "device_id": "Mobile Device",
           "target_iban": "Target IBAN (Credit Card)",
-          "recipient_name": "Recipient Name (as on Bank Account)"
+          "recipient_name": "Recipient Name (as on Bank Account)",
+          "package": "Banking App Package (Optional, e.g. de.fiduciagad.direkt1822.banking)"
         }
       }
     },

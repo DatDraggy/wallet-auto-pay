@@ -22,6 +22,7 @@ from .const import (
     CONF_DEVICE_ID,
     CONF_TARGET_IBAN,
     CONF_RECIPIENT_NAME,
+    CONF_PACKAGE,
     ACTION_PAY_NOW,
     ACTION_ADD_TODO,
     DEFAULT_FALLBACK_TIMEOUT,
@@ -55,16 +56,16 @@ SERVICE_PAY_NEXT_ITEM_SCHEMA = vol.Schema(
 )
 
 
-def get_giro_intent_url(recipient: str, iban: str, amount: Decimal, merchant: str) -> str:
+def get_giro_intent_url(recipient: str, iban: str, amount: Decimal, merchant: str, package: str = None) -> str:
     """Generate a pre-filled banking Intent URI for Android."""
     encoded_recipient = urllib.parse.quote(recipient)
     encoded_reason = urllib.parse.quote(f"Auto-Pay {merchant}")
     
-    # Corrected package name for 1822direkt: de.fiduciagad.direkt1822.banking
-    return (
-        f"intent://payment?name={encoded_recipient}&iban={iban}&amount={amount}&reason={encoded_reason}"
-        f"#Intent;scheme=giro;package=de.fiduciagad.direkt1822.banking;end"
-    )
+    intent = f"intent://payment?name={encoded_recipient}&iban={iban}&amount={amount}&reason={encoded_reason}#Intent;scheme=giro;"
+    if package:
+        intent += f"package={package};"
+    intent += "end"
+    return intent
 
 
 async def async_add_to_todo(hass: HomeAssistant, entry_id: str, amount: Decimal, merchant: str) -> None:
@@ -100,10 +101,11 @@ async def async_send_payment_notification(
     amount: Decimal, 
     merchant: str,
     entry_id: str,
-    txn_id: str = None
+    txn_id: str = None,
+    package: str = None
 ) -> None:
     """Send a notification with a direct Intent button."""
-    intent_url = get_giro_intent_url(recipient, iban, amount, merchant)
+    intent_url = get_giro_intent_url(recipient, iban, amount, merchant, package)
     
     actions = [{"action": "URI", "title": "Jetzt bezahlen", "uri": intent_url}]
     if txn_id:
@@ -187,7 +189,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             await async_send_payment_notification(
                 hass, notify_service, entry.data[CONF_RECIPIENT_NAME],
-                entry.data[CONF_TARGET_IBAN], amount, merchant, entry.entry_id, txn_id
+                entry.data[CONF_TARGET_IBAN], amount, merchant, entry.entry_id, txn_id,
+                entry.data.get(CONF_PACKAGE)
             )
 
     state_listener = async_track_state_change_event(hass, notification_sensor, _handle_state_change)
@@ -213,7 +216,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await async_send_payment_notification(
                 hass, hass.data[DOMAIN][target_entry.entry_id]["notify"],
                 target_entry.data[CONF_RECIPIENT_NAME], target_entry.data[CONF_TARGET_IBAN],
-                amount, merchant, target_entry.entry_id
+                amount, merchant, target_entry.entry_id,
+                package=target_entry.data.get(CONF_PACKAGE)
             )
 
     # Service Handlers

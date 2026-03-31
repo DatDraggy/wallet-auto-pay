@@ -16,6 +16,7 @@ from .const import (
     CONF_DEVICE_ID,
     CONF_TARGET_IBAN,
     CONF_RECIPIENT_NAME,
+    CONF_PACKAGE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -29,6 +30,9 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
             selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT)
         ),
         vol.Required(CONF_RECIPIENT_NAME): selector.TextSelector(
+            selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT)
+        ),
+        vol.Optional(CONF_PACKAGE): selector.TextSelector(
             selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT)
         ),
     }
