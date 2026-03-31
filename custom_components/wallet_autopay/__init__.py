@@ -81,7 +81,7 @@ async def async_trigger_deep_link(hass: HomeAssistant, entry: ConfigEntry, amoun
     iban = entry.data[CONF_TARGET_IBAN]
     reason = urllib.parse.quote(f"Auto-Pay {merchant}")
     
-    # GIRO URL Scheme for Sparkasse/1822direkt
+    # GIRO URL Scheme
     giro_url = f"giro://x-callback-url/payment?name={recipient}&iban={iban}&amount={amount}&reason={reason}"
     
     await hass.services.async_call(
@@ -91,7 +91,10 @@ async def async_trigger_deep_link(hass: HomeAssistant, entry: ConfigEntry, amoun
             "message": "command_activity",
             "data": {
                 "intent_action": "android.intent.action.VIEW",
-                "intent_uri": giro_url
+                "intent_uri": giro_url,
+                "intent_package": "de.fiducia.it.gic.android.direkt1822",
+                "priority": "high",
+                "ttl": 0
             }
         }
     )
