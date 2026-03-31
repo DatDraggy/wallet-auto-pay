@@ -48,6 +48,12 @@ SERVICE_PAY_TODO_ITEM_SCHEMA = vol.Schema(
     }
 )
 
+SERVICE_PAY_NEXT_ITEM_SCHEMA = vol.Schema(
+    {
+        vol.Required("entity_id"): cv.entity_id,
+    }
+)
+
 
 def get_giro_url(recipient: str, iban: str, amount: Decimal, merchant: str) -> str:
     """Generate a pre-filled banking URI."""
@@ -94,10 +100,7 @@ async def async_send_payment_notification(
     """Send a notification with a direct URI action button."""
     giro_url = get_giro_url(recipient, iban, amount, merchant)
     
-    # Use 'WALLET_TODO' for the callback if we have a txn_id
-    # If no txn_id (manual service call), we just provide the Pay button
     actions = [{"action": "URI", "title": "Jetzt bezahlen", "uri": giro_url}]
-    
     if txn_id:
         actions.append({"action": f"{ACTION_ADD_TODO}::{entry_id}::{txn_id}", "title": "Später (To-Do)"})
 
@@ -108,7 +111,7 @@ async def async_send_payment_notification(
             "message": f"Wallet: {amount}€ bei {merchant}. Banking App öffnen?",
             "title": "Wallet Auto-Pay",
             "data": {
-                "clickAction": giro_url, # Clicking the notification itself opens the app
+                "clickAction": giro_url,
                 "actions": actions,
                 "priority": "high",
                 "ttl": 0
@@ -178,14 +181,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             async_call_later(hass, DEFAULT_FALLBACK_TIMEOUT, _fallback)
 
             await async_send_payment_notification(
-                hass, 
-                notify_service, 
-                entry.data[CONF_RECIPIENT_NAME],
-                entry.data[CONF_TARGET_IBAN],
-                amount,
-                merchant,
-                entry.entry_id,
-                txn_id
+                hass, notify_service, entry.data[CONF_RECIPIENT_NAME],
+                entry.data[CONF_TARGET_IBAN], amount, merchant, entry.entry_id, txn_id
             )
 
     state_listener = async_track_state_change_event(hass, notification_sensor, _handle_state_change)
@@ -194,67 +191,63 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def _handle_action(event: Event) -> None:
         action = event.data.get("action", "")
         if "::" not in action: return
-        
         act_type, ent_id, txn_id = action.split("::")
         if ent_id != entry.entry_id: return
-
         pending = hass.data[DOMAIN][entry.entry_id]["pending"].pop(txn_id, None)
         if not pending: return
-
         if act_type == ACTION_ADD_TODO:
             await async_add_to_todo(hass, entry.entry_id, pending["amount"], pending["merchant"])
 
     action_listener = hass.bus.async_listen(EVENT_MOBILE_APP_NOTIFICATION_ACTION, _handle_action)
     hass.data[DOMAIN][entry.entry_id]["listeners"].append(action_listener)
 
-    # Register services
+    # Services
     async def handle_pay_transaction(call: ServiceCall) -> None:
-        """Service to trigger a payment notification manually."""
         amount = call.data["amount"]
         merchant = call.data["merchant"]
         call_entry_id = call.data.get("entry_id", entry.entry_id)
         target_entry = hass.config_entries.async_get_entry(call_entry_id)
         if target_entry:
             await async_send_payment_notification(
-                hass, 
-                hass.data[DOMAIN][target_entry.entry_id]["notify"],
-                target_entry.data[CONF_RECIPIENT_NAME],
-                target_entry.data[CONF_TARGET_IBAN],
-                amount,
-                merchant,
-                target_entry.entry_id
+                hass, hass.data[DOMAIN][target_entry.entry_id]["notify"],
+                target_entry.data[CONF_RECIPIENT_NAME], target_entry.data[CONF_TARGET_IBAN],
+                amount, merchant, target_entry.entry_id
             )
 
     async def handle_pay_todo_item(call: ServiceCall) -> None:
-        """Service to parse a To-Do item and trigger payment notification."""
         entity_id = call.data["entity_id"]
         item_name = call.data["item_name"]
-        
         match = re.search(r"Pay\s+(\d+(?:[.,]\d{1,2})?)€\s+for\s+(.+)", item_name, re.I)
-        if not match:
-            _LOGGER.error("Could not parse To-Do item: %s", item_name)
-            return
+        if match:
+            amount, merchant = Decimal(match.group(1).replace(",", ".")), match.group(2).strip()
+            entity_entry = er.async_get(hass).async_get(entity_id)
+            if entity_entry and entity_entry.config_entry_id:
+                config_entry = hass.config_entries.async_get_entry(entity_entry.config_entry_id)
+                if config_entry:
+                    await async_send_payment_notification(
+                        hass, hass.data[DOMAIN][config_entry.entry_id]["notify"],
+                        config_entry.data[CONF_RECIPIENT_NAME], config_entry.data[CONF_TARGET_IBAN],
+                        amount, merchant, config_entry.entry_id
+                    )
 
-        amount = Decimal(match.group(1).replace(",", "."))
-        merchant = match.group(2).strip()
+    async def handle_pay_next_item(call: ServiceCall) -> None:
+        """Pay the first available item in the todo list."""
+        entity_id = call.data["entity_id"]
+        # In HA, todo items are not in attributes, we must get them from the entity object
+        component = hass.data.get("todo")
+        if not component: return
+        entity = component.get_entity(entity_id)
+        if not entity or not entity.todo_items:
+            _LOGGER.warning("No items found in To-Do list %s", entity_id)
+            return
         
-        ent_reg = er.async_get(hass)
-        entity_entry = ent_reg.async_get(entity_id)
-        if entity_entry and entity_entry.config_entry_id:
-            config_entry = hass.config_entries.async_get_entry(entity_entry.config_entry_id)
-            if config_entry:
-                await async_send_payment_notification(
-                    hass, 
-                    hass.data[DOMAIN][config_entry.entry_id]["notify"],
-                    config_entry.data[CONF_RECIPIENT_NAME],
-                    config_entry.data[CONF_TARGET_IBAN],
-                    amount,
-                    merchant,
-                    config_entry.entry_id
-                )
+        # Get the first item
+        item = entity.todo_items[0]
+        await handle_pay_todo_item(ServiceCall(DOMAIN, "pay_todo_item", {"entity_id": entity_id, "item_name": item.summary}))
 
     hass.services.async_register(DOMAIN, "pay_transaction", handle_pay_transaction, schema=SERVICE_PAY_TRANSACTION_SCHEMA)
     hass.services.async_register(DOMAIN, "pay_todo_item", handle_pay_todo_item, schema=SERVICE_PAY_TODO_ITEM_SCHEMA)
+    hass.services.async_register(DOMAIN, "pay_next_item", handle_pay_next_item, schema=SERVICE_PAY_NEXT_ITEM_SCHEMA)
 
     return True
 
@@ -265,9 +258,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for listener in hass.data[DOMAIN][entry.entry_id]["listeners"]:
             listener()
         hass.data[DOMAIN].pop(entry.entry_id)
-        
         if not hass.data[DOMAIN]:
             hass.services.async_remove(DOMAIN, "pay_transaction")
             hass.services.async_remove(DOMAIN, "pay_todo_item")
-            
+            hass.services.async_remove(DOMAIN, "pay_next_item")
     return unload_ok

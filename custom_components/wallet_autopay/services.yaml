@@ -28,7 +28,7 @@ pay_transaction:
         text:
 
 pay_todo_item:
-  name: Pay from To-Do List
+  name: Pay specific To-Do item
   description: Parses a specific item from your Wallet Auto-Pay To-Do list and sends the payment link to your phone.
   fields:
     entity_id:
@@ -45,3 +45,15 @@ pay_todo_item:
       required: true
       selector:
         text:
+
+pay_next_item:
+  name: Pay Next Item
+  description: Automatically picks the oldest unpaid item from the To-Do list and triggers the payment prompt on your phone.
+  fields:
+    entity_id:
+      name: To-Do Entity
+      description: The To-Do list list to pay from.
+      required: true
+      selector:
+        entity:
+          domain: todo
