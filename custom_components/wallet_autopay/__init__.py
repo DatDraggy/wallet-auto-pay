@@ -60,11 +60,10 @@ def get_giro_intent_url(recipient: str, iban: str, amount: Decimal, merchant: st
     encoded_recipient = urllib.parse.quote(recipient)
     encoded_reason = urllib.parse.quote(f"Auto-Pay {merchant}")
     
-    # We remove the hardcoded package to allow the Android App Picker to find the right app.
-    # This also fixes the Play Store loop on newer Android versions.
+    # Corrected package name for 1822direkt: de.fiduciagad.direkt1822.banking
     return (
         f"intent://payment?name={encoded_recipient}&iban={iban}&amount={amount}&reason={encoded_reason}"
-        f"#Intent;scheme=giro;end"
+        f"#Intent;scheme=giro;package=de.fiduciagad.direkt1822.banking;end"
     )
 
 
@@ -207,18 +206,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     action_listener = hass.bus.async_listen(EVENT_MOBILE_APP_NOTIFICATION_ACTION, _handle_action)
     hass.data[DOMAIN][entry.entry_id]["listeners"].append(action_listener)
 
-    # Services
-    async def handle_pay_transaction(call: ServiceCall) -> None:
-        amount = call.data["amount"]
-        merchant = call.data["merchant"]
-        call_entry_id = call.data.get("entry_id", entry.entry_id)
-        target_entry = hass.config_entries.async_get_entry(call_entry_id)
-        if target_entry:
+    # Internal helper to handle payment logic for services
+    async def process_payment(amount: Decimal, merchant: str, config_entry_id: str):
+        target_entry = hass.config_entries.async_get_entry(config_entry_id)
+        if target_entry and target_entry.entry_id in hass.data[DOMAIN]:
             await async_send_payment_notification(
                 hass, hass.data[DOMAIN][target_entry.entry_id]["notify"],
                 target_entry.data[CONF_RECIPIENT_NAME], target_entry.data[CONF_TARGET_IBAN],
                 amount, merchant, target_entry.entry_id
             )
+
+    # Service Handlers
+    async def handle_pay_transaction(call: ServiceCall) -> None:
+        await process_payment(
+            call.data["amount"], 
+            call.data["merchant"], 
+            call.data.get("entry_id", entry.entry_id)
+        )
 
     async def handle_pay_todo_item(call: ServiceCall) -> None:
         entity_id = call.data["entity_id"]
@@ -228,26 +232,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             amount, merchant = Decimal(match.group(1).replace(",", ".")), match.group(2).strip()
             entity_entry = er.async_get(hass).async_get(entity_id)
             if entity_entry and entity_entry.config_entry_id:
-                config_entry = hass.config_entries.async_get_entry(entity_entry.config_entry_id)
-                if config_entry:
-                    await async_send_payment_notification(
-                        hass, hass.data[DOMAIN][config_entry.entry_id]["notify"],
-                        config_entry.data[CONF_RECIPIENT_NAME], config_entry.data[CONF_TARGET_IBAN],
-                        amount, merchant, config_entry.entry_id
-                    )
+                await process_payment(amount, merchant, entity_entry.config_entry_id)
 
     async def handle_pay_next_item(call: ServiceCall) -> None:
-        """Pay the first available item in the todo list."""
         entity_id = call.data["entity_id"]
         component = hass.data.get("todo")
         if not component: return
-        entity = component.get_entity(entity_id)
-        if not entity or not entity.todo_items:
+        todo_list = component.get_entity(entity_id)
+        if not todo_list or not todo_list.todo_items:
             _LOGGER.warning("No items found in To-Do list %s", entity_id)
             return
         
-        item = entity.todo_items[0]
-        await handle_pay_todo_item(ServiceCall(DOMAIN, "pay_todo_item", {"entity_id": entity_id, "item_name": item.summary}))
+        # Parse the first item
+        item = todo_list.todo_items[0]
+        match = re.search(r"Pay\s+(\d+(?:[.,]\d{1,2})?)€\s+for\s+(.+)", item.summary, re.I)
+        if match:
+            amount, merchant = Decimal(match.group(1).replace(",", ".")), match.group(2).strip()
+            entity_entry = er.async_get(hass).async_get(entity_id)
+            if entity_entry and entity_entry.config_entry_id:
+                await process_payment(amount, merchant, entity_entry.config_entry_id)
 
     hass.services.async_register(DOMAIN, "pay_transaction", handle_pay_transaction, schema=SERVICE_PAY_TRANSACTION_SCHEMA)
     hass.services.async_register(DOMAIN, "pay_todo_item", handle_pay_todo_item, schema=SERVICE_PAY_TODO_ITEM_SCHEMA)
