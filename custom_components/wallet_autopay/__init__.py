@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+import io
 from decimal import Decimal
 import urllib.parse
 from typing import Any
@@ -13,9 +14,12 @@ from homeassistant.core import Event, HomeAssistant, State, ServiceCall
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.event import async_track_state_change_event, async_call_later
 from homeassistant.components.notify import DOMAIN as NOTIFY_DOMAIN
+from homeassistant.components.http import HomeAssistantView
 from homeassistant.const import Platform
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
+
+import qrcode
 
 from .const import (
     DOMAIN,
@@ -23,7 +27,6 @@ from .const import (
     CONF_TARGET_IBAN,
     CONF_RECIPIENT_NAME,
     CONF_PACKAGE,
-    ACTION_PAY_NOW,
     ACTION_ADD_TODO,
     DEFAULT_FALLBACK_TIMEOUT,
 )
@@ -56,18 +59,73 @@ SERVICE_PAY_NEXT_ITEM_SCHEMA = vol.Schema(
 )
 
 
-def get_giro_intent_url(recipient: str, iban: str, amount: Decimal, merchant: str, package: str = None) -> str:
-    """Generate a pre-filled banking Intent URI for Android."""
-    encoded_recipient = urllib.parse.quote(recipient)
-    encoded_reason = urllib.parse.quote(f"Auto-Pay {merchant}")
+def generate_epc_qr(recipient: str, iban: str, amount: Decimal, merchant: str) -> bytes:
+    """Generate a standard EPC QR Code (GiroCode) as PNG bytes."""
+    # Standard EPC format:
+    # Service Tag: BCD
+    # Version: 002
+    # Character set: 1 (UTF-8)
+    # Identification: SCT (SEPA Credit Transfer)
+    # BIC: (Optional for SEPA)
+    # Name: Recipient Name
+    # IBAN: Destination IBAN
+    # Amount: EUR followed by amount
+    # Purpose: (Empty)
+    # Remittance: Merchant / Reason
+    # Information: (Empty)
     
-    # We use a more generic intent format that defaults to the 'giro' scheme.
-    # If a package is provided, we target it. Otherwise, we let Android pick.
-    intent = f"intent://payment?name={encoded_recipient}&iban={iban}&amount={amount}&reason={encoded_reason}#Intent;scheme=giro;action=android.intent.action.VIEW;"
-    if package and package.strip():
-        intent += f"package={package.strip()};"
-    intent += "end"
-    return intent
+    epc_lines = [
+        "BCD",
+        "002",
+        "1",
+        "SCT",
+        "", # BIC
+        recipient,
+        iban,
+        f"EUR{amount:.2f}",
+        "", # Purpose
+        f"Auto-Pay {merchant}"[:140],
+        "" # Information
+    ]
+    epc_string = "\n".join(epc_lines)
+    
+    qr = qrcode.QRCode(version=1, box_size=10, border=4)
+    qr.add_data(epc_string)
+    qr.make(fit=True)
+    
+    img = qr.make_image(fill_color="black", back_color="white")
+    img_byte_arr = io.BytesIO()
+    img.save(img_byte_arr, format='PNG')
+    return img_byte_arr.getvalue()
+
+
+class GiroCodeView(HomeAssistantView):
+    """View to serve generated GiroCode images."""
+    url = "/api/wallet_autopay/qr/{txn_id}.png"
+    name = "api:wallet_autopay:qr"
+    requires_auth = False # Standard for notification images
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def get(self, request, txn_id):
+        """Handle image request."""
+        # Find the txn in any of the entries' pending dicts
+        for entry_id in self.hass.data[DOMAIN]:
+            pending = self.hass.data[DOMAIN][entry_id].get("pending", {})
+            if txn_id in pending:
+                data = pending[txn_id]
+                image_bytes = await self.hass.async_add_executor_job(
+                    generate_epc_qr,
+                    data["recipient"],
+                    data["iban"],
+                    data["amount"],
+                    data["merchant"]
+                )
+                from aiohttp import web
+                return web.Response(body=image_bytes, content_type="image/png")
+        
+        return web.Response(status=404)
 
 
 async def async_add_to_todo(hass: HomeAssistant, entry_id: str, amount: Decimal, merchant: str) -> None:
@@ -80,17 +138,13 @@ async def async_add_to_todo(hass: HomeAssistant, entry_id: str, amount: Decimal,
             todo_entity = entity.entity_id
             break
 
-    if not todo_entity:
-        _LOGGER.error("Could not find To-Do entity for entry %s", entry_id)
-        return
+    if not todo_entity: return
 
     try:
         await hass.services.async_call(
-            "todo",
-            "add_item",
+            "todo", "add_item",
             {"entity_id": todo_entity, "item": f"Pay {amount}€ for {merchant}"},
         )
-        _LOGGER.info("Transaction for %s added to to-do list.", merchant)
     except Exception as e:
         _LOGGER.error("Failed to add to to-do list: %s", e)
 
@@ -103,23 +157,33 @@ async def async_send_payment_notification(
     amount: Decimal, 
     merchant: str,
     entry_id: str,
-    txn_id: str = None,
+    txn_id: str,
     package: str = None
 ) -> None:
-    """Send a notification with a direct Intent button."""
-    intent_url = get_giro_intent_url(recipient, iban, amount, merchant, package)
+    """Send a notification with the QR code and targeted Intent."""
     
-    actions = [{"action": "URI", "title": "Jetzt bezahlen", "uri": intent_url}]
-    if txn_id:
-        actions.append({"action": f"{ACTION_ADD_TODO}::{entry_id}::{txn_id}", "title": "Später (To-Do)"})
+    # URL to our internal image server
+    image_url = f"/api/wallet_autopay/qr/{txn_id}.png"
+    
+    # We provide the direct 'Share' action. This is the 'Photo Transfer' flow.
+    # We use 'image/png' and targeted package to bypass the share sheet.
+    actions = [
+        {
+            "action": "URI", 
+            "title": "Jetzt bezahlen", 
+            "uri": image_url # On Android, clicking this URI action with an image URL opens it
+        },
+        {"action": f"{ACTION_ADD_TODO}::{entry_id}::{txn_id}", "title": "Später (To-Do)"}
+    ]
 
     await hass.services.async_call(
         NOTIFY_DOMAIN,
         notify_service,
         {
-            "message": f"Wallet: {amount}€ bei {merchant}. Banking App öffnen?",
+            "message": f"Wallet: {amount}€ bei {merchant}. Banking App mit QR-Code öffnen?",
             "title": "Wallet Auto-Pay",
             "data": {
+                "image": image_url,
                 "actions": actions,
                 "importance": "high",
                 "priority": "high",
@@ -133,29 +197,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Wallet Auto-Pay from a config entry."""
     hass.data.setdefault(DOMAIN, {})
     
+    # Register the image view if not already done
+    if not any(isinstance(v, GiroCodeView) for v in hass.http.views):
+        hass.http.register_view(GiroCodeView(hass))
+    
     ent_reg = er.async_get(hass)
     device_id = entry.data[CONF_DEVICE_ID]
     
     notification_sensor = None
-    entities = er.async_entries_for_device(ent_reg, device_id)
-    for ent in entities:
-        if ent.domain == "sensor" and (
-            "last_notification" in ent.entity_id or 
-            "last_notification" in (ent.unique_id or "").lower() or
-            ent.original_name == "Last Notification"
-        ):
+    for ent in er.async_entries_for_device(ent_reg, device_id):
+        if ent.domain == "sensor" and ("last_notification" in ent.entity_id or "last_notification" in (ent.unique_id or "").lower()):
             notification_sensor = ent.entity_id
             break
             
-    if not notification_sensor:
-        _LOGGER.error("Could not find 'Last Notification' sensor for device %s.", device_id)
-        return False
+    if not notification_sensor: return False
 
     dev_reg = dr.async_get(hass)
     device = dev_reg.async_get(device_id)
-    if not device:
-        _LOGGER.error("Selected device no longer exists.")
-        return False
+    if not device: return False
         
     notify_service = f"mobile_app_{device.name.lower().replace(' ', '_').replace('-', '_')}"
 
@@ -180,12 +239,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             merchant = match.group(2).strip()
             txn_id = uuid.uuid4().hex
             
-            hass.data[DOMAIN][entry.entry_id]["pending"][txn_id] = {"amount": amount, "merchant": merchant}
+            # Store full payment info for the image generator
+            hass.data[DOMAIN][entry.entry_id]["pending"][txn_id] = {
+                "amount": amount, 
+                "merchant": merchant,
+                "recipient": entry.data[CONF_RECIPIENT_NAME],
+                "iban": entry.data[CONF_TARGET_IBAN]
+            }
 
             async def _fallback(_now):
                 pending = hass.data[DOMAIN][entry.entry_id]["pending"].pop(txn_id, None)
-                if pending:
-                    await async_add_to_todo(hass, entry.entry_id, pending["amount"], pending["merchant"])
+                if pending: await async_add_to_todo(hass, entry.entry_id, pending["amount"], pending["merchant"])
 
             async_call_later(hass, DEFAULT_FALLBACK_TIMEOUT, _fallback)
 
@@ -211,53 +275,48 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     action_listener = hass.bus.async_listen(EVENT_MOBILE_APP_NOTIFICATION_ACTION, _handle_action)
     hass.data[DOMAIN][entry.entry_id]["listeners"].append(action_listener)
 
-    # Internal helper to handle payment logic for services
+    # Service Handlers
     async def process_payment(amount: Decimal, merchant: str, config_entry_id: str):
         target_entry = hass.config_entries.async_get_entry(config_entry_id)
         if target_entry and target_entry.entry_id in hass.data[DOMAIN]:
+            txn_id = uuid.uuid4().hex
+            hass.data[DOMAIN][target_entry.entry_id]["pending"][txn_id] = {
+                "amount": amount, "merchant": merchant,
+                "recipient": target_entry.data[CONF_RECIPIENT_NAME],
+                "iban": target_entry.data[CONF_TARGET_IBAN]
+            }
             await async_send_payment_notification(
                 hass, hass.data[DOMAIN][target_entry.entry_id]["notify"],
                 target_entry.data[CONF_RECIPIENT_NAME], target_entry.data[CONF_TARGET_IBAN],
-                amount, merchant, target_entry.entry_id,
+                amount, merchant, target_entry.entry_id, txn_id,
                 package=target_entry.data.get(CONF_PACKAGE)
             )
 
-    # Service Handlers
     async def handle_pay_transaction(call: ServiceCall) -> None:
-        await process_payment(
-            call.data["amount"], 
-            call.data["merchant"], 
-            call.data.get("entry_id", entry.entry_id)
-        )
+        await process_payment(call.data["amount"], call.data["merchant"], call.data.get("entry_id", entry.entry_id))
 
     async def handle_pay_todo_item(call: ServiceCall) -> None:
         entity_id = call.data["entity_id"]
-        item_name = call.data["item_name"]
-        match = re.search(r"Pay\s+(\d+(?:[.,]\d{1,2})?)€\s+for\s+(.+)", item_name, re.I)
+        match = re.search(r"Pay\s+(\d+(?:[.,]\d{1,2})?)€\s+for\s+(.+)", call.data["item_name"], re.I)
         if match:
             amount, merchant = Decimal(match.group(1).replace(",", ".")), match.group(2).strip()
-            ent_reg = er.async_get(hass)
-            entity_entry = ent_reg.async_get(entity_id)
+            entity_entry = er.async_get(hass).async_get(entity_id)
             if entity_entry and entity_entry.config_entry_id:
                 await process_payment(amount, merchant, entity_entry.config_entry_id)
 
     async def handle_pay_next_item(call: ServiceCall) -> None:
-        """Pay the first available item in the todo list."""
         entity_id = call.data["entity_id"]
-        # Use component to get entity object
         component = hass.data.get("todo")
         if not component: return
         todo_list = component.get_entity(entity_id)
-        if not todo_list or not todo_list.todo_items:
-            _LOGGER.warning("No items found in To-Do list %s", entity_id)
-            return
-        
+        if not todo_list or not todo_list.todo_items: return
         item = todo_list.todo_items[0]
-        # Recursively call handle_pay_todo_item with the found summary
-        await handle_pay_todo_item(ServiceCall(DOMAIN, "pay_todo_item", {
-            "entity_id": entity_id,
-            "item_name": item.summary
-        }))
+        match = re.search(r"Pay\s+(\d+(?:[.,]\d{1,2})?)€\s+for\s+(.+)", item.summary, re.I)
+        if match:
+            amount, merchant = Decimal(match.group(1).replace(",", ".")), match.group(2).strip()
+            entity_entry = er.async_get(hass).async_get(entity_id)
+            if entity_entry and entity_entry.config_entry_id:
+                await process_payment(amount, merchant, entity_entry.config_entry_id)
 
     hass.services.async_register(DOMAIN, "pay_transaction", handle_pay_transaction, schema=SERVICE_PAY_TRANSACTION_SCHEMA)
     hass.services.async_register(DOMAIN, "pay_todo_item", handle_pay_todo_item, schema=SERVICE_PAY_TODO_ITEM_SCHEMA)
@@ -269,8 +328,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        for listener in hass.data[DOMAIN][entry.entry_id]["listeners"]:
-            listener()
+        for listener in hass.data[DOMAIN][entry.entry_id]["listeners"]: listener()
         hass.data[DOMAIN].pop(entry.entry_id)
         if not hass.data[DOMAIN]:
             hass.services.async_remove(DOMAIN, "pay_transaction")
