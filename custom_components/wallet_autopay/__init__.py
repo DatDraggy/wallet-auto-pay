@@ -59,13 +59,12 @@ def get_giro_intent_url(recipient: str, iban: str, amount: Decimal, merchant: st
     """Generate a pre-filled banking Intent URI for Android."""
     encoded_recipient = urllib.parse.quote(recipient)
     encoded_reason = urllib.parse.quote(f"Auto-Pay {merchant}")
-    # giro://payment format is more standard for direct triggers
-    giro_data = f"giro://payment?name={encoded_recipient}&iban={iban}&amount={amount}&reason={encoded_reason}"
     
-    # Wrap in intent:// to force Android OS handling and bypass HASS internal 404s
+    # We remove the hardcoded package to allow the Android App Picker to find the right app.
+    # This also fixes the Play Store loop on newer Android versions.
     return (
         f"intent://payment?name={encoded_recipient}&iban={iban}&amount={amount}&reason={encoded_reason}"
-        f"#Intent;scheme=giro;package=de.fiducia.it.gic.android.direkt1822;end"
+        f"#Intent;scheme=giro;end"
     )
 
 
@@ -107,7 +106,6 @@ async def async_send_payment_notification(
     """Send a notification with a direct Intent button."""
     intent_url = get_giro_intent_url(recipient, iban, amount, merchant)
     
-    # We use action: "URI" which is handled by the Android app to open the external intent
     actions = [{"action": "URI", "title": "Jetzt bezahlen", "uri": intent_url}]
     if txn_id:
         actions.append({"action": f"{ACTION_ADD_TODO}::{entry_id}::{txn_id}", "title": "Später (To-Do)"})
