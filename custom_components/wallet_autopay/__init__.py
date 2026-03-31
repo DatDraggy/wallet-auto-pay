@@ -20,7 +20,7 @@ from homeassistant.const import Platform
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 from .const import (
     DOMAIN,
@@ -54,38 +54,37 @@ SERVICE_PAY_NEXT_ITEM_SCHEMA = vol.Schema({
 })
 
 
-def generate_invoice_image(recipient: str, iban: str, amount: Decimal, merchant: str) -> bytes:
-    """Generate a clean, OCR-friendly invoice image for banking apps."""
-    # Create a white background image (standard A4 ratio or readable rectangle)
-    width, height = 800, 600
+def generate_invoice_pdf(recipient: str, iban: str, amount: Decimal, merchant: str) -> bytes:
+    """Generate a clean, OCR-friendly invoice PDF for banking apps."""
+    # Create a high-res white canvas
+    width, height = 1240, 1754 # A4 at 150 DPI
     img = Image.new('RGB', (width, height), color='white')
     draw = ImageDraw.Draw(img)
     
-    # Text content - using keywords most OCRs look for
+    # Text content designed to trigger banking OCR
     lines = [
-        ("RECHNUNG", 40, True),
-        (f"Zahlungsempfänger: {recipient}", 25, False),
-        (f"IBAN: {iban}", 25, True),
-        (f"Rechnungsbetrag: {amount:.2f} EUR", 30, True),
-        (f"Verwendungszweck: Auto-Pay {merchant}", 20, False),
-        (f"Datum: {urllib.parse.quote(merchant)}", 15, False), # Fake meta data helps OCR
+        ("RECHNUNG", 60),
+        (f"Empfänger: {recipient}", 40),
+        (f"IBAN: {iban}", 40),
+        (f"Betrag: {amount:.2f} EUR", 50),
+        (f"Verwendungszweck: Auto-Pay {merchant}", 30),
+        (f"Referenz: {uuid.uuid4().hex[:8].upper()}", 20),
     ]
     
-    y_offset = 50
-    for text, size, is_bold in lines:
-        # Standard PIL doesn't have easy bolding without loading specific fonts,
-        # so we just use size and spacing for contrast.
-        draw.text((50, y_offset), text, fill='black')
-        y_offset += size + 20
+    y_offset = 150
+    for text, spacing in lines:
+        draw.text((100, y_offset), text, fill='black')
+        y_offset += spacing + 60
 
-    img_byte_arr = io.BytesIO()
-    img.save(img_byte_arr, format='PNG')
-    return img_byte_arr.getvalue()
+    # Save as PDF
+    pdf_byte_arr = io.BytesIO()
+    img.save(pdf_byte_arr, format='PDF', resolution=150.0)
+    return pdf_byte_arr.getvalue()
 
 
-class InvoiceImageView(HomeAssistantView):
-    """View to serve generated invoice images."""
-    url = "/api/wallet_autopay/invoice/{txn_id}.png"
+class InvoicePDFView(HomeAssistantView):
+    """View to serve generated invoice PDFs."""
+    url = "/api/wallet_autopay/invoice/{txn_id}.pdf"
     name = "api:wallet_autopay:invoice"
     requires_auth = False
 
@@ -97,11 +96,11 @@ class InvoiceImageView(HomeAssistantView):
             pending = entry_data.get("pending", {})
             if txn_id in pending:
                 data = pending[txn_id]
-                image_bytes = await self.hass.async_add_executor_job(
-                    generate_invoice_image, data["recipient"], data["iban"], data["amount"], data["merchant"]
+                pdf_bytes = await self.hass.async_add_executor_job(
+                    generate_invoice_pdf, data["recipient"], data["iban"], data["amount"], data["merchant"]
                 )
                 from aiohttp import web
-                return web.Response(body=image_bytes, content_type="image/png")
+                return web.Response(body=pdf_bytes, content_type="application/pdf")
         from aiohttp import web
         return web.Response(status=404)
 
@@ -116,8 +115,8 @@ async def async_add_to_todo(hass: HomeAssistant, entry_id: str, amount: Decimal,
     except Exception as e: _LOGGER.error("Failed to add to todo: %s", e)
 
 
-async def async_trigger_photo_transfer(hass: HomeAssistant, entry_id: str, txn_id: str) -> None:
-    """Send the command_activity to trigger the banking app's photo transfer scanner."""
+async def async_trigger_pdf_transfer(hass: HomeAssistant, entry_id: str, txn_id: str) -> None:
+    """Send the command_activity to share the PDF with the banking app."""
     entry_data = hass.data[DOMAIN]["entries"].get(entry_id)
     if not entry_data: return
 
@@ -125,7 +124,7 @@ async def async_trigger_photo_transfer(hass: HomeAssistant, entry_id: str, txn_i
     package = config_entry.data.get(CONF_PACKAGE, "de.fiduciagad.direkt1822.banking").strip()
     
     base_url = get_url(hass, allow_internal=False, prefer_external=True)
-    image_url = f"{base_url}/api/wallet_autopay/invoice/{txn_id}.png"
+    pdf_url = f"{base_url}/api/wallet_autopay/invoice/{txn_id}.pdf"
 
     await hass.services.async_call(
         NOTIFY_DOMAIN,
@@ -134,9 +133,9 @@ async def async_trigger_photo_transfer(hass: HomeAssistant, entry_id: str, txn_i
             "message": "command_activity",
             "data": {
                 "intent_action": "android.intent.action.SEND",
-                "intent_type": "image/png",
+                "intent_type": "application/pdf",
                 "intent_package": package,
-                "intent_extras": f"android.intent.extra.STREAM:{image_url}",
+                "intent_extras": f"android.intent.extra.STREAM:{pdf_url}",
                 "priority": "high",
                 "ttl": 0
             }
@@ -146,22 +145,22 @@ async def async_trigger_photo_transfer(hass: HomeAssistant, entry_id: str, txn_i
 
 async def async_send_payment_notification(hass: HomeAssistant, notify_service: str, amount: Decimal, merchant: str, entry_id: str, txn_id: str) -> None:
     """Send a notification with custom action buttons."""
-    image_url = f"/api/wallet_autopay/invoice/{txn_id}.png"
+    # We still show a small text preview but the action is PDF sharing
     actions = [
-        {"action": f"{ACTION_PAY_NOW}::{entry_id}::{txn_id}", "title": "Foto-Überweisung"},
+        {"action": f"{ACTION_PAY_NOW}::{entry_id}::{txn_id}", "title": "In Banking-App öffnen"},
         {"action": f"{ACTION_ADD_TODO}::{entry_id}::{txn_id}", "title": "Später (To-Do)"}
     ]
     await hass.services.async_call(NOTIFY_DOMAIN, notify_service, {
-        "message": f"Wallet: {amount}€ bei {merchant}. Banking App (Foto-Überweisung) öffnen?",
+        "message": f"Wallet: {amount}€ bei {merchant}. Rechnung in Banking App importieren?",
         "title": "Wallet Auto-Pay",
-        "data": {"image": image_url, "actions": actions, "importance": "high", "priority": "high", "ttl": 0},
+        "data": {"actions": actions, "importance": "high", "priority": "high", "ttl": 0},
     })
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {"view_registered": False, "entries": {}})
     if not hass.data[DOMAIN]["view_registered"]:
-        hass.http.register_view(InvoiceImageView(hass))
+        hass.http.register_view(InvoicePDFView(hass))
         hass.data[DOMAIN]["view_registered"] = True
     
     ent_reg = er.async_get(hass)
@@ -201,20 +200,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         pending = hass.data[DOMAIN]["entries"][entry.entry_id]["pending"].get(txn_id)
         if not pending: return
         if act_type == ACTION_PAY_NOW:
-            await async_trigger_photo_transfer(hass, entry.entry_id, txn_id)
+            await async_trigger_pdf_transfer(hass, entry.entry_id, txn_id)
         elif act_type == ACTION_ADD_TODO:
             hass.data[DOMAIN]["entries"][entry.entry_id]["pending"].pop(txn_id, None)
             await async_add_to_todo(hass, entry.entry_id, pending["amount"], pending["merchant"])
 
     hass.data[DOMAIN]["entries"][entry.entry_id]["listeners"].append(hass.bus.async_listen(EVENT_MOBILE_APP_NOTIFICATION_ACTION, _handle_action))
 
-    async def handle_pay_transaction(call: ServiceCall) -> None:
-        target_id = call.data.get("entry_id", entry.entry_id)
-        if target_id in hass.data[DOMAIN]["entries"]:
+    async def process_payment(amount: Decimal, merchant: str, config_entry_id: str):
+        target_entry = hass.config_entries.async_get_entry(config_entry_id)
+        if target_entry and target_entry.entry_id in hass.data[DOMAIN]["entries"]:
             txn_id = uuid.uuid4().hex
-            t_entry = hass.config_entries.async_get_entry(target_id)
-            hass.data[DOMAIN]["entries"][target_id]["pending"][txn_id] = {"amount": call.data["amount"], "merchant": call.data["merchant"], "recipient": t_entry.data[CONF_RECIPIENT_NAME], "iban": t_entry.data[CONF_TARGET_IBAN]}
-            await async_send_payment_notification(hass, hass.data[DOMAIN]["entries"][target_id]["notify"], call.data["amount"], call.data["merchant"], target_id, txn_id)
+            hass.data[DOMAIN]["entries"][target_entry.entry_id]["pending"][txn_id] = {"amount": amount, "merchant": merchant, "recipient": target_entry.data[CONF_RECIPIENT_NAME], "iban": target_entry.data[CONF_TARGET_IBAN]}
+            await async_send_payment_notification(hass, hass.data[DOMAIN]["entries"][target_entry.entry_id]["notify"], amount, merchant, target_entry.entry_id, txn_id)
+
+    async def handle_pay_transaction(call: ServiceCall) -> None:
+        await process_payment(call.data["amount"], call.data["merchant"], call.data.get("entry_id", entry.entry_id))
 
     async def handle_pay_todo_item(call: ServiceCall) -> None:
         match = re.search(r"Pay\s+(\d+(?:[.,]\d{1,2})?)€\s+for\s+(.+)", call.data["item_name"], re.I)
@@ -222,10 +223,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             amount, merchant = Decimal(match.group(1).replace(",", ".")), match.group(2).strip()
             entity_entry = er.async_get(hass).async_get(call.data["entity_id"])
             if entity_entry and entity_entry.config_entry_id:
-                txn_id = uuid.uuid4().hex
-                t_entry = hass.config_entries.async_get_entry(entity_entry.config_entry_id)
-                hass.data[DOMAIN]["entries"][t_entry.entry_id]["pending"][txn_id] = {"amount": amount, "merchant": merchant, "recipient": t_entry.data[CONF_RECIPIENT_NAME], "iban": t_entry.data[CONF_TARGET_IBAN]}
-                await async_send_payment_notification(hass, hass.data[DOMAIN]["entries"][t_entry.entry_id]["notify"], amount, merchant, t_entry.entry_id, txn_id)
+                await process_payment(amount, merchant, entity_entry.config_entry_id)
 
     async def handle_pay_next_item(call: ServiceCall) -> None:
         component = hass.data.get("todo")
