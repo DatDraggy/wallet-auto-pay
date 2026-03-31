@@ -1,9 +1,9 @@
-"""Test the FinTS Auto-Pay To-Do list."""
+"""Test the Wallet Auto-Pay To-Do list."""
 from homeassistant.core import HomeAssistant
 from homeassistant.components.todo import TodoItem, TodoItemStatus
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.fints_autopay.const import DOMAIN
+from custom_components.wallet_autopay.const import DOMAIN
 from tests.const import MOCK_CONFIG
 from tests.test_init import setup_mock_registries
 
@@ -20,20 +20,21 @@ async def test_todo_list_operations(hass: HomeAssistant) -> None:
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    state = hass.states.get("todo.fints_auto_pay_testuser")
+    # The name is slugified from "Wallet Auto-Pay: John Doe"
+    entity_id = "todo.wallet_auto_pay_john_doe"
+    state = hass.states.get(entity_id)
     assert state is not None
 
     # Test adding an item
     await hass.services.async_call(
         "todo",
         "add_item",
-        {"entity_id": "todo.fints_auto_pay_testuser", "item": "Test Item"},
+        {"entity_id": entity_id, "item": "Test Item"},
         blocking=True,
     )
     
     # Verify item exists
-    # We need to access the entity through the component
-    todo_list = hass.data["todo"].get_entity("todo.fints_auto_pay_testuser")
+    todo_list = hass.data["todo"].get_entity(entity_id)
     assert len(todo_list.todo_items) == 1
     assert todo_list.todo_items[0].summary == "Test Item"
     
@@ -43,7 +44,7 @@ async def test_todo_list_operations(hass: HomeAssistant) -> None:
         "todo",
         "update_item",
         {
-            "entity_id": "todo.fints_auto_pay_testuser",
+            "entity_id": entity_id,
             "item": item_id,
             "rename": "Updated Item",
             "status": "completed",
@@ -57,7 +58,7 @@ async def test_todo_list_operations(hass: HomeAssistant) -> None:
     await hass.services.async_call(
         "todo",
         "remove_item",
-        {"entity_id": "todo.fints_auto_pay_testuser", "item": [item_id]},
+        {"entity_id": entity_id, "item": [item_id]},
         blocking=True,
     )
     assert len(todo_list.todo_items) == 0

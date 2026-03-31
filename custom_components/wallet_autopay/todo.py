@@ -1,4 +1,4 @@
-"""Support for FinTS Auto-Pay To-Do list."""
+"""Support for Wallet Auto-Pay To-Do list."""
 from __future__ import annotations
 
 import uuid
@@ -13,19 +13,19 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, CONF_USERNAME
+from .const import DOMAIN, CONF_RECIPIENT_NAME
 
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the FinTS To-Do list."""
-    async_add_entities([FintsAutopayTodoList(entry)], update_before_add=True)
+    """Set up the Wallet To-Do list."""
+    async_add_entities([WalletAutopayTodoList(entry)], update_before_add=True)
 
 
-class FintsAutopayTodoList(TodoListEntity):
-    """A FinTS Auto-Pay To-Do list."""
+class WalletAutopayTodoList(TodoListEntity):
+    """A Wallet Auto-Pay To-Do list."""
 
     _attr_has_entity_name = True
     _attr_should_poll = False
@@ -38,7 +38,7 @@ class FintsAutopayTodoList(TodoListEntity):
     def __init__(self, entry: ConfigEntry) -> None:
         """Initialize the to-do list."""
         self._attr_unique_id = f"{entry.entry_id}_todo"
-        self._attr_name = f"FinTS Auto-Pay: {entry.data[CONF_USERNAME]}"
+        self._attr_name = f"Wallet Auto-Pay: {entry.data[CONF_RECIPIENT_NAME]}"
         self._items: list[TodoItem] = []
 
     @property
@@ -48,7 +48,6 @@ class FintsAutopayTodoList(TodoListEntity):
 
     async def async_create_todo_item(self, item: TodoItem) -> None:
         """Create a new to-do item."""
-        # Home Assistant might not provide a UID during creation via service call
         if not item.uid:
             item.uid = uuid.uuid4().hex
         self._items.append(item)

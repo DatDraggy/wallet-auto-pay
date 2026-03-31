@@ -1,53 +1,60 @@
-"""The FinTS Auto-Pay integration."""
+"""The Wallet Auto-Pay integration."""
 from __future__ import annotations
 
 import logging
 import re
 import uuid
 from decimal import Decimal
-from datetime import timedelta
+import urllib.parse
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import Event, HomeAssistant, State
+from homeassistant.core import Event, HomeAssistant, State, ServiceCall
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.event import async_track_state_change_event, async_call_later
 from homeassistant.components.notify import DOMAIN as NOTIFY_DOMAIN
 from homeassistant.const import Platform
-
-from fints.client import FinTS3PinTanClient
-from fints.exceptions import FinTSError
+import homeassistant.helpers.config_validation as cv
+import voluptuous as vol
 
 from .const import (
     DOMAIN,
     CONF_DEVICE_ID,
-    CONF_BLZ,
-    CONF_USERNAME,
-    CONF_PIN,
-    CONF_ENDPOINT,
     CONF_TARGET_IBAN,
     CONF_RECIPIENT_NAME,
+    ACTION_PAY_NOW,
+    ACTION_ADD_TODO,
+    DEFAULT_FALLBACK_TIMEOUT,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.TODO]
 EVENT_MOBILE_APP_NOTIFICATION_ACTION = "mobile_app_notification_action"
-ACTION_PAY_NOW = "FINTS_PAY"
-ACTION_ADD_TODO = "FINTS_TODO"
-DEFAULT_FALLBACK_TIMEOUT = 3600
+
+# Service schemas
+SERVICE_PAY_TRANSACTION_SCHEMA = vol.Schema(
+    {
+        vol.Required("amount"): vol.Coerce(Decimal),
+        vol.Required("merchant"): cv.string,
+        vol.Optional("entry_id"): cv.string,
+    }
+)
 
 
 async def async_add_to_todo(hass: HomeAssistant, entry_id: str, amount: Decimal, merchant: str) -> None:
     """Add a transaction to the auto-created To-Do list."""
-    todo_entity = f"todo.fints_auto_pay_{entry_id.replace('-', '_')}" # Fallback guess if registry lookup fails
-    
-    # Try to find the actual entity_id from the registry
     ent_reg = er.async_get(hass)
     entities = er.async_entries_for_config_entry(ent_reg, entry_id)
+    todo_entity = None
     for entity in entities:
         if entity.domain == "todo":
             todo_entity = entity.entity_id
             break
+
+    if not todo_entity:
+        _LOGGER.error("Could not find To-Do entity for entry %s", entry_id)
+        return
 
     try:
         await hass.services.async_call(
@@ -55,42 +62,45 @@ async def async_add_to_todo(hass: HomeAssistant, entry_id: str, amount: Decimal,
             "add_item",
             {"entity_id": todo_entity, "item": f"Pay {amount}€ for {merchant}"},
         )
-        _LOGGER.info("Fallback: Transaction for %s added to to-do list.", merchant)
+        _LOGGER.info("Transaction for %s added to to-do list.", merchant)
     except Exception as e:
         _LOGGER.error("Failed to add to to-do list: %s", e)
 
 
-def execute_fints_transfer(config_data: dict, amount: Decimal, merchant: str) -> None:
-    """Execute SEPA transfer via FinTS."""
-    client = FinTS3PinTanClient(
-        config_data[CONF_BLZ],
-        config_data[CONF_USERNAME],
-        config_data[CONF_PIN],
-        config_data[CONF_ENDPOINT],
+async def async_trigger_deep_link(hass: HomeAssistant, entry: ConfigEntry, amount: Decimal, merchant: str) -> None:
+    """Send the command_activity intent to the phone."""
+    dev_reg = dr.async_get(hass)
+    device = dev_reg.async_get(entry.data[CONF_DEVICE_ID])
+    if not device:
+        _LOGGER.error("Device not found for deep link.")
+        return
+
+    notify_service = f"mobile_app_{device.name.lower().replace(' ', '_').replace('-', '_')}"
+    
+    recipient = urllib.parse.quote(entry.data[CONF_RECIPIENT_NAME])
+    iban = entry.data[CONF_TARGET_IBAN]
+    reason = urllib.parse.quote(f"Auto-Pay {merchant}")
+    
+    # GIRO URL Scheme for Sparkasse/1822direkt
+    giro_url = f"giro://x-callback-url/payment?name={recipient}&iban={iban}&amount={amount}&reason={reason}"
+    
+    await hass.services.async_call(
+        NOTIFY_DOMAIN,
+        notify_service,
+        {
+            "message": "command_activity",
+            "data": {
+                "intent_action": "android.intent.action.VIEW",
+                "intent_uri": giro_url
+            }
+        }
     )
-
-    with client:
-        accounts = client.get_sepa_accounts()
-        if not accounts:
-            raise ValueError("No SEPA accounts found.")
-
-        account = accounts[0]
-        client.simple_sepa_transfer(
-            account=account,
-            iban=config_data[CONF_TARGET_IBAN],
-            bic="",
-            recipient_name=config_data[CONF_RECIPIENT_NAME],
-            amount=amount,
-            account_name="Checking Account",
-            reason=f"Auto-Pay {merchant}",
-        )
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up FinTS Auto-Pay from a config entry."""
+    """Set up Wallet Auto-Pay from a config entry."""
     hass.data.setdefault(DOMAIN, {})
     
-    # Find the Last Notification sensor for this device
     ent_reg = er.async_get(hass)
     device_id = entry.data[CONF_DEVICE_ID]
     
@@ -102,20 +112,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             break
             
     if not notification_sensor:
-        _LOGGER.error("Could not find 'Last Notification' sensor for the selected device.")
+        _LOGGER.error("Could not find 'Last Notification' sensor for device %s", device_id)
         return False
 
-    # Derive notify service from device registry
     dev_reg = dr.async_get(hass)
     device = dev_reg.async_get(device_id)
     if not device:
         _LOGGER.error("Selected device no longer exists.")
         return False
         
-    # The mobile_app integration usually names the notify service: notify.mobile_app_<slugified_device_name>
-    # We can try to find it via the companion app's naming convention
-    device_name_slug = dr.format_mac(device.name).replace(":", "_").lower() if not device.name else "unknown"
-    # A more reliable way is to look at the 'mobile_app' notify services directly
     notify_service = f"mobile_app_{device.name.lower().replace(' ', '_').replace('-', '_')}"
 
     hass.data[DOMAIN][entry.entry_id] = {
@@ -155,11 +160,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 NOTIFY_DOMAIN,
                 notify_service,
                 {
-                    "message": f"Google Wallet: {amount}€ at {merchant}. Pay now?",
-                    "title": "FinTS Auto-Pay",
+                    "message": f"Google Wallet: {amount}€ at {merchant}. Open banking app?",
+                    "title": "Wallet Auto-Pay",
                     "data": {
                         "actions": [
-                            {"action": action_pay, "title": "Pay Now"},
+                            {"action": action_pay, "title": "Pay Now (Open App)"},
                             {"action": action_todo, "title": "Add to To-Do"}
                         ]
                     },
@@ -180,16 +185,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not pending: return
 
         if act_type == ACTION_PAY_NOW:
-            try:
-                await hass.async_add_executor_job(execute_fints_transfer, entry.data, pending["amount"], pending["merchant"])
-                _LOGGER.info("Payment successful.")
-            except Exception as e:
-                _LOGGER.error("Payment failed: %s", e)
+            await async_trigger_deep_link(hass, entry, pending["amount"], pending["merchant"])
         elif act_type == ACTION_ADD_TODO:
             await async_add_to_todo(hass, entry.entry_id, pending["amount"], pending["merchant"])
 
     action_listener = hass.bus.async_listen(EVENT_MOBILE_APP_NOTIFICATION_ACTION, _handle_action)
     hass.data[DOMAIN][entry.entry_id]["listeners"].append(action_listener)
+
+    # Register services
+    async def handle_pay_transaction(call: ServiceCall) -> None:
+        """Service to trigger a payment deep link manually."""
+        amount = call.data["amount"]
+        merchant = call.data["merchant"]
+        call_entry_id = call.data.get("entry_id", entry.entry_id)
+        
+        target_entry = hass.config_entries.async_get_entry(call_entry_id)
+        if target_entry:
+            await async_trigger_deep_link(hass, target_entry, amount, merchant)
+
+    hass.services.async_register(
+        DOMAIN, "pay_transaction", handle_pay_transaction, schema=SERVICE_PAY_TRANSACTION_SCHEMA
+    )
 
     return True
 
@@ -200,4 +216,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for listener in hass.data[DOMAIN][entry.entry_id]["listeners"]:
             listener()
         hass.data[DOMAIN].pop(entry.entry_id)
+        
+        # Unregister service if no entries left
+        if not hass.data[DOMAIN]:
+            hass.services.async_remove(DOMAIN, "pay_transaction")
+            
     return unload_ok

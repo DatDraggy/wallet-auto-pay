@@ -1,0 +1,12 @@
+{
+  "domain": "wallet_autopay",
+  "name": "Wallet Auto-Pay",
+  "codeowners": ["@DatDraggy"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/DatDraggy/wallet-auto-pay",
+  "issue_tracker": "https://github.com/DatDraggy/wallet-auto-pay/issues",
+  "iot_class": "local_push",
+  "requirements": [],
+  "version": "1.0.0"
+}

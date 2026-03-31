@@ -1,4 +1,4 @@
-# FinTS Auto-Pay for Home Assistant
+# Wallet Auto-Pay for Home Assistant
 
 Replicate a "Debit Card" experience for credit cards.
 

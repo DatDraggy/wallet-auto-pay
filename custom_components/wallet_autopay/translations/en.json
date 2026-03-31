@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Wallet Auto-Pay",
+        "description": "Select the device running the Home Assistant Companion App and provide the card details. When you click 'Pay Now', your banking app will open pre-filled.",
+        "data": {
+          "device_id": "Mobile Device",
+          "target_iban": "Target IBAN (Credit Card)",
+          "recipient_name": "Recipient Name (as on Bank Account)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect",
+      "invalid_auth": "Invalid configuration",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "Device is already configured"
+    }
+  }
+}
