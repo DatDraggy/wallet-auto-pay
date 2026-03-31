@@ -107,10 +107,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     notification_sensor = None
     entities = er.async_entries_for_device(ent_reg, device_id)
     for ent in entities:
-        # Check original name OR unique_id suffix (standard for mobile_app)
+        # Very aggressive check: domain sensor + 'last_notification' anywhere in ID or name
         if ent.domain == "sensor" and (
-            ent.original_name == "Last Notification" or 
-            ent.unique_id.endswith("last_notification")
+            "last_notification" in ent.entity_id or 
+            "last_notification" in (ent.unique_id or "").lower() or
+            ent.original_name == "Last Notification"
         ):
             notification_sensor = ent.entity_id
             break
@@ -118,18 +119,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not notification_sensor:
         _LOGGER.error(
             "Could not find 'Last Notification' sensor for device %s. "
-            "Ensure 'Last Notification' is enabled in the Companion App 'Manage Sensors' settings.",
-            device_id
+            "Available entities on device: %s",
+            device_id,
+            [e.entity_id for e in entities]
         )
         return False
 
-    dev_reg = dr.async_get(hass)
-    device = dev_reg.async_get(device_id)
-    if not device:
-        _LOGGER.error("Selected device no longer exists.")
-        return False
-        
-    notify_service = f"mobile_app_{device.name.lower().replace(' ', '_').replace('-', '_')}"
+    # Derive notify service from the sensor name
+    # e.g. sensor.pixel_9_pro_xl_last_notification -> mobile_app_pixel_9_pro_xl
+    device_slug = notification_sensor.replace("sensor.", "").replace("_last_notification", "")
+    notify_service = f"mobile_app_{device_slug}"
 
     hass.data[DOMAIN][entry.entry_id] = {
         "pending": {},
