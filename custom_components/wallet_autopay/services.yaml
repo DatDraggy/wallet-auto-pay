@@ -1,0 +1,47 @@
+pay_transaction:
+  name: Send Payment Notification
+  description: Manually trigger a banking deep link notification on your phone.
+  fields:
+    amount:
+      name: Amount
+      description: The monetary amount to pay (e.g., 12.34).
+      example: 12.34
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 1000000
+          step: 0.01
+          mode: box
+    merchant:
+      name: Merchant
+      description: The name of the shop or recipient.
+      example: "Starbucks"
+      required: true
+      selector:
+        text:
+    entry_id:
+      name: Config Entry
+      description: Optional ID of the specific integration instance to use.
+      required: false
+      selector:
+        text:
+
+pay_todo_item:
+  name: Pay from To-Do List
+  description: Parses a specific item from your Wallet Auto-Pay To-Do list and sends the payment link to your phone.
+  fields:
+    entity_id:
+      name: To-Do Entity
+      description: The To-Do list containing the item.
+      required: true
+      selector:
+        entity:
+          domain: todo
+    item_name:
+      name: Item Name
+      description: The exact text of the item (e.g., "Pay 12.34€ for Starbucks").
+      example: "Pay 12.34€ for Starbucks"
+      required: true
+      selector:
+        text:
