@@ -198,8 +198,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     
     # Register the image view if not already done
-    if not any(isinstance(v, GiroCodeView) for v in hass.http.views):
+    if not hass.data[DOMAIN].get("view_registered"):
         hass.http.register_view(GiroCodeView(hass))
+        hass.data[DOMAIN]["view_registered"] = True
     
     ent_reg = er.async_get(hass)
     device_id = entry.data[CONF_DEVICE_ID]
