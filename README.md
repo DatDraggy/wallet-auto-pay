@@ -5,7 +5,7 @@ Replicate a "Debit Card" experience for credit cards.
 ## Features
 - **Silent Monitoring**: Listens for Google Wallet notifications from the HA Companion App.
 - **Actionable Push**: Asks "Pay Now" or "Add to To-Do List" immediately after a tap-to-pay event.
-- **FinTS Integration**: Executes a secure SEPA transfer from your checking account to your credit card using the `python-fints` library.
+- **Direct Banking Deep Links**: Sends a pre-filled Giro/SEPA deep link to your phone to quickly open your banking app.
 - **Multi-User**: Supports multiple independent bank accounts and phone sensors via Config Flow.
 
 ## Setup
