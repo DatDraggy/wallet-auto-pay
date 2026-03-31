@@ -107,12 +107,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     notification_sensor = None
     entities = er.async_entries_for_device(ent_reg, device_id)
     for ent in entities:
-        if ent.domain == "sensor" and ent.original_name == "Last Notification":
+        # Check original name OR unique_id suffix (standard for mobile_app)
+        if ent.domain == "sensor" and (
+            ent.original_name == "Last Notification" or 
+            ent.unique_id.endswith("last_notification")
+        ):
             notification_sensor = ent.entity_id
             break
             
     if not notification_sensor:
-        _LOGGER.error("Could not find 'Last Notification' sensor for device %s", device_id)
+        _LOGGER.error(
+            "Could not find 'Last Notification' sensor for device %s. "
+            "Ensure 'Last Notification' is enabled in the Companion App 'Manage Sensors' settings.",
+            device_id
+        )
         return False
 
     dev_reg = dr.async_get(hass)
