@@ -20,7 +20,7 @@ from homeassistant.const import Platform
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
 
-import qrcode
+from PIL import Image, ImageDraw, ImageFont
 
 from .const import (
     DOMAIN,
@@ -54,23 +54,39 @@ SERVICE_PAY_NEXT_ITEM_SCHEMA = vol.Schema({
 })
 
 
-def generate_epc_qr(recipient: str, iban: str, amount: Decimal, merchant: str) -> bytes:
-    """Generate a standard EPC QR Code (GiroCode) as PNG bytes."""
-    epc_lines = ["BCD", "002", "1", "SCT", "", recipient, iban, f"EUR{amount:.2f}", "", f"Auto-Pay {merchant}"[:140], ""]
-    epc_string = "\n".join(epc_lines)
-    qr = qrcode.QRCode(version=1, box_size=10, border=4)
-    qr.add_data(epc_string)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
+def generate_invoice_image(recipient: str, iban: str, amount: Decimal, merchant: str) -> bytes:
+    """Generate a clean, OCR-friendly invoice image for banking apps."""
+    # Create a white background image (standard A4 ratio or readable rectangle)
+    width, height = 800, 600
+    img = Image.new('RGB', (width, height), color='white')
+    draw = ImageDraw.Draw(img)
+    
+    # Text content - using keywords most OCRs look for
+    lines = [
+        ("RECHNUNG", 40, True),
+        (f"Zahlungsempfänger: {recipient}", 25, False),
+        (f"IBAN: {iban}", 25, True),
+        (f"Rechnungsbetrag: {amount:.2f} EUR", 30, True),
+        (f"Verwendungszweck: Auto-Pay {merchant}", 20, False),
+        (f"Datum: {urllib.parse.quote(merchant)}", 15, False), # Fake meta data helps OCR
+    ]
+    
+    y_offset = 50
+    for text, size, is_bold in lines:
+        # Standard PIL doesn't have easy bolding without loading specific fonts,
+        # so we just use size and spacing for contrast.
+        draw.text((50, y_offset), text, fill='black')
+        y_offset += size + 20
+
     img_byte_arr = io.BytesIO()
     img.save(img_byte_arr, format='PNG')
     return img_byte_arr.getvalue()
 
 
-class GiroCodeView(HomeAssistantView):
-    """View to serve generated GiroCode images."""
-    url = "/api/wallet_autopay/qr/{txn_id}.png"
-    name = "api:wallet_autopay:qr"
+class InvoiceImageView(HomeAssistantView):
+    """View to serve generated invoice images."""
+    url = "/api/wallet_autopay/invoice/{txn_id}.png"
+    name = "api:wallet_autopay:invoice"
     requires_auth = False
 
     def __init__(self, hass: HomeAssistant):
@@ -82,7 +98,7 @@ class GiroCodeView(HomeAssistantView):
             if txn_id in pending:
                 data = pending[txn_id]
                 image_bytes = await self.hass.async_add_executor_job(
-                    generate_epc_qr, data["recipient"], data["iban"], data["amount"], data["merchant"]
+                    generate_invoice_image, data["recipient"], data["iban"], data["amount"], data["merchant"]
                 )
                 from aiohttp import web
                 return web.Response(body=image_bytes, content_type="image/png")
@@ -108,9 +124,8 @@ async def async_trigger_photo_transfer(hass: HomeAssistant, entry_id: str, txn_i
     config_entry = hass.config_entries.async_get_entry(entry_id)
     package = config_entry.data.get(CONF_PACKAGE, "de.fiduciagad.direkt1822.banking").strip()
     
-    # Get the absolute URL for the QR code
     base_url = get_url(hass, allow_internal=False, prefer_external=True)
-    image_url = f"{base_url}/api/wallet_autopay/qr/{txn_id}.png"
+    image_url = f"{base_url}/api/wallet_autopay/invoice/{txn_id}.png"
 
     await hass.services.async_call(
         NOTIFY_DOMAIN,
@@ -131,13 +146,13 @@ async def async_trigger_photo_transfer(hass: HomeAssistant, entry_id: str, txn_i
 
 async def async_send_payment_notification(hass: HomeAssistant, notify_service: str, amount: Decimal, merchant: str, entry_id: str, txn_id: str) -> None:
     """Send a notification with custom action buttons."""
-    image_url = f"/api/wallet_autopay/qr/{txn_id}.png"
+    image_url = f"/api/wallet_autopay/invoice/{txn_id}.png"
     actions = [
-        {"action": f"{ACTION_PAY_NOW}::{entry_id}::{txn_id}", "title": "Jetzt bezahlen"},
+        {"action": f"{ACTION_PAY_NOW}::{entry_id}::{txn_id}", "title": "Foto-Überweisung"},
         {"action": f"{ACTION_ADD_TODO}::{entry_id}::{txn_id}", "title": "Später (To-Do)"}
     ]
     await hass.services.async_call(NOTIFY_DOMAIN, notify_service, {
-        "message": f"Wallet: {amount}€ bei {merchant}. Banking App mit QR-Code öffnen?",
+        "message": f"Wallet: {amount}€ bei {merchant}. Banking App (Foto-Überweisung) öffnen?",
         "title": "Wallet Auto-Pay",
         "data": {"image": image_url, "actions": actions, "importance": "high", "priority": "high", "ttl": 0},
     })
@@ -146,7 +161,7 @@ async def async_send_payment_notification(hass: HomeAssistant, notify_service: s
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {"view_registered": False, "entries": {}})
     if not hass.data[DOMAIN]["view_registered"]:
-        hass.http.register_view(GiroCodeView(hass))
+        hass.http.register_view(InvoiceImageView(hass))
         hass.data[DOMAIN]["view_registered"] = True
     
     ent_reg = er.async_get(hass)
@@ -183,11 +198,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if "::" not in action: return
         act_type, ent_id, txn_id = action.split("::")
         if ent_id != entry.entry_id: return
-        
-        # Note: We don't pop yet for PAY_NOW so the image view can still serve the QR code
         pending = hass.data[DOMAIN]["entries"][entry.entry_id]["pending"].get(txn_id)
         if not pending: return
-
         if act_type == ACTION_PAY_NOW:
             await async_trigger_photo_transfer(hass, entry.entry_id, txn_id)
         elif act_type == ACTION_ADD_TODO:
