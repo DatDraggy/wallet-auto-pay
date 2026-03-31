@@ -61,9 +61,11 @@ def get_giro_intent_url(recipient: str, iban: str, amount: Decimal, merchant: st
     encoded_recipient = urllib.parse.quote(recipient)
     encoded_reason = urllib.parse.quote(f"Auto-Pay {merchant}")
     
-    intent = f"intent://payment?name={encoded_recipient}&iban={iban}&amount={amount}&reason={encoded_reason}#Intent;scheme=giro;"
-    if package:
-        intent += f"package={package};"
+    # We use a more generic intent format that defaults to the 'giro' scheme.
+    # If a package is provided, we target it. Otherwise, we let Android pick.
+    intent = f"intent://payment?name={encoded_recipient}&iban={iban}&amount={amount}&reason={encoded_reason}#Intent;scheme=giro;action=android.intent.action.VIEW;"
+    if package and package.strip():
+        intent += f"package={package.strip()};"
     intent += "end"
     return intent
 
@@ -234,12 +236,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         match = re.search(r"Pay\s+(\d+(?:[.,]\d{1,2})?)€\s+for\s+(.+)", item_name, re.I)
         if match:
             amount, merchant = Decimal(match.group(1).replace(",", ".")), match.group(2).strip()
-            entity_entry = er.async_get(hass).async_get(entity_id)
+            ent_reg = er.async_get(hass)
+            entity_entry = ent_reg.async_get(entity_id)
             if entity_entry and entity_entry.config_entry_id:
                 await process_payment(amount, merchant, entity_entry.config_entry_id)
 
     async def handle_pay_next_item(call: ServiceCall) -> None:
+        """Pay the first available item in the todo list."""
         entity_id = call.data["entity_id"]
+        # Use component to get entity object
         component = hass.data.get("todo")
         if not component: return
         todo_list = component.get_entity(entity_id)
@@ -247,14 +252,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.warning("No items found in To-Do list %s", entity_id)
             return
         
-        # Parse the first item
         item = todo_list.todo_items[0]
-        match = re.search(r"Pay\s+(\d+(?:[.,]\d{1,2})?)€\s+for\s+(.+)", item.summary, re.I)
-        if match:
-            amount, merchant = Decimal(match.group(1).replace(",", ".")), match.group(2).strip()
-            entity_entry = er.async_get(hass).async_get(entity_id)
-            if entity_entry and entity_entry.config_entry_id:
-                await process_payment(amount, merchant, entity_entry.config_entry_id)
+        # Recursively call handle_pay_todo_item with the found summary
+        await handle_pay_todo_item(ServiceCall(DOMAIN, "pay_todo_item", {
+            "entity_id": entity_id,
+            "item_name": item.summary
+        }))
 
     hass.services.async_register(DOMAIN, "pay_transaction", handle_pay_transaction, schema=SERVICE_PAY_TRANSACTION_SCHEMA)
     hass.services.async_register(DOMAIN, "pay_todo_item", handle_pay_todo_item, schema=SERVICE_PAY_TODO_ITEM_SCHEMA)
