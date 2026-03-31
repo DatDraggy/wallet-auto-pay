@@ -55,11 +55,18 @@ SERVICE_PAY_NEXT_ITEM_SCHEMA = vol.Schema(
 )
 
 
-def get_giro_url(recipient: str, iban: str, amount: Decimal, merchant: str) -> str:
-    """Generate a pre-filled banking URI."""
+def get_giro_intent_url(recipient: str, iban: str, amount: Decimal, merchant: str) -> str:
+    """Generate a pre-filled banking Intent URI for Android."""
     encoded_recipient = urllib.parse.quote(recipient)
     encoded_reason = urllib.parse.quote(f"Auto-Pay {merchant}")
-    return f"giro://x-callback-url/payment?name={encoded_recipient}&iban={iban}&amount={amount}&reason={encoded_reason}"
+    # giro://payment format is more standard for direct triggers
+    giro_data = f"giro://payment?name={encoded_recipient}&iban={iban}&amount={amount}&reason={encoded_reason}"
+    
+    # Wrap in intent:// to force Android OS handling and bypass HASS internal 404s
+    return (
+        f"intent://payment?name={encoded_recipient}&iban={iban}&amount={amount}&reason={encoded_reason}"
+        f"#Intent;scheme=giro;package=de.fiducia.it.gic.android.direkt1822;end"
+    )
 
 
 async def async_add_to_todo(hass: HomeAssistant, entry_id: str, amount: Decimal, merchant: str) -> None:
@@ -97,10 +104,11 @@ async def async_send_payment_notification(
     entry_id: str,
     txn_id: str = None
 ) -> None:
-    """Send a notification with a direct URI action button."""
-    giro_url = get_giro_url(recipient, iban, amount, merchant)
+    """Send a notification with a direct Intent button."""
+    intent_url = get_giro_intent_url(recipient, iban, amount, merchant)
     
-    actions = [{"action": "URI", "title": "Jetzt bezahlen", "uri": giro_url}]
+    # We use action: "URI" which is handled by the Android app to open the external intent
+    actions = [{"action": "URI", "title": "Jetzt bezahlen", "uri": intent_url}]
     if txn_id:
         actions.append({"action": f"{ACTION_ADD_TODO}::{entry_id}::{txn_id}", "title": "Später (To-Do)"})
 
@@ -111,8 +119,8 @@ async def async_send_payment_notification(
             "message": f"Wallet: {amount}€ bei {merchant}. Banking App öffnen?",
             "title": "Wallet Auto-Pay",
             "data": {
-                "clickAction": giro_url,
                 "actions": actions,
+                "importance": "high",
                 "priority": "high",
                 "ttl": 0
             },
@@ -233,7 +241,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def handle_pay_next_item(call: ServiceCall) -> None:
         """Pay the first available item in the todo list."""
         entity_id = call.data["entity_id"]
-        # In HA, todo items are not in attributes, we must get them from the entity object
         component = hass.data.get("todo")
         if not component: return
         entity = component.get_entity(entity_id)
@@ -241,7 +248,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.warning("No items found in To-Do list %s", entity_id)
             return
         
-        # Get the first item
         item = entity.todo_items[0]
         await handle_pay_todo_item(ServiceCall(DOMAIN, "pay_todo_item", {"entity_id": entity_id, "item_name": item.summary}))
 
