@@ -8,7 +8,8 @@
           "device_id": "Mobile Device",
           "target_iban": "Target IBAN (Credit Card)",
           "recipient_name": "Recipient Name (as on Bank Account)",
-          "package": "Banking App Package (Optional, e.g. de.fiduciagad.direkt1822.banking)"
+          "package": "Banking App Package (Optional, e.g. de.fiduciagad.direkt1822.banking)",
+          "todo_only": "ToDo only (App has no support for image sharing)"
         }
       }
     },
@@ -19,6 +20,43 @@
     },
     "abort": {
       "already_configured": "Device is already configured"
+    }
+  },
+  "notify": {
+    "todo_only_message": "Wallet: {amount}€ for {merchant}. Added to To-Do list for manual processing.",
+    "payment_notification_message": "Wallet: {amount}€ at {merchant}. Open banking app with QR code?",
+    "pay_now": "Pay Now",
+    "pay_later": "Later (To-Do)",
+    "no_items_to_pay": "No items in To-Do list to pay."
+  },
+  "services": {
+    "pay_next_item": {
+      "name": "Pay next item",
+      "description": "Shows the QR code for the next item in the To-Do list and marks it as completed.",
+      "fields": {
+        "entity_id": {
+          "name": "Entity ID",
+          "description": "The To-Do list entity ID."
+        }
+      }
+    },
+    "trigger_payment_notification": {
+      "name": "Trigger payment notification",
+      "description": "Manually sends the full interactive payment notification (QR code + buttons) to the mobile device.",
+      "fields": {
+        "amount": {
+          "name": "Amount",
+          "description": "The payment amount."
+        },
+        "merchant": {
+          "name": "Merchant",
+          "description": "The name of the merchant."
+        },
+        "entry_id": {
+          "name": "Entry ID",
+          "description": "Optional: Specific integration entry ID."
+        }
+      }
     }
   }
 }

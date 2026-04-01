@@ -11,7 +11,7 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, State, ServiceCall
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import device_registry as dr, entity_registry as er, translation
 from homeassistant.helpers.event import async_track_state_change_event, async_call_later
 from homeassistant.helpers.network import get_url
 from homeassistant.components.notify import DOMAIN as NOTIFY_DOMAIN
@@ -28,6 +28,7 @@ from .const import (
     CONF_TARGET_IBAN,
     CONF_RECIPIENT_NAME,
     CONF_PACKAGE,
+    CONF_TODO_ONLY,
     ACTION_PAY_NOW,
     ACTION_ADD_TODO,
     DEFAULT_FALLBACK_TIMEOUT,
@@ -52,6 +53,14 @@ SERVICE_PAY_TODO_ITEM_SCHEMA = vol.Schema({
 SERVICE_PAY_NEXT_ITEM_SCHEMA = vol.Schema({
     vol.Required("entity_id"): cv.entity_id,
 })
+
+async def async_get_localized_string(hass: HomeAssistant, key: str, language: str = None) -> str:
+    """Get a localized string for the notification."""
+    if language is None:
+        language = hass.config.language
+    
+    translations = await translation.async_get_translations(hass, language, "notify", [DOMAIN])
+    return translations.get(f"component.{DOMAIN}.notify.{key}", key)
 
 
 def generate_epc_qr(recipient: str, iban: str, amount: Decimal, merchant: str) -> bytes:
@@ -82,7 +91,7 @@ class GiroCodeView(HomeAssistantView):
             if txn_id in pending:
                 data = pending[txn_id]
                 image_bytes = await self.hass.async_add_executor_job(
-                    generate_epc_qr, data["recipient"], data["iban"], data["amount"], data["merchant"]
+                    generate_epc_qr, data.get("recipient", ""), data.get("iban", ""), data["amount"], data["merchant"]
                 )
                 from aiohttp import web
                 return web.Response(body=image_bytes, content_type="image/png")
@@ -106,7 +115,8 @@ async def async_trigger_photo_transfer(hass: HomeAssistant, entry_id: str, txn_i
     if not entry_data: return
 
     config_entry = hass.config_entries.async_get_entry(entry_id)
-    package = config_entry.data.get(CONF_PACKAGE, "de.fiduciagad.direkt1822.banking").strip()
+    opts = config_entry.options if config_entry.options else config_entry.data
+    package = opts.get(CONF_PACKAGE, "de.fiduciagad.direkt1822.banking").strip()
     
     # Get the absolute URL for the QR code
     base_url = get_url(hass, allow_internal=False, prefer_external=True)
@@ -129,17 +139,34 @@ async def async_trigger_photo_transfer(hass: HomeAssistant, entry_id: str, txn_i
     )
 
 
-async def async_send_payment_notification(hass: HomeAssistant, notify_service: str, amount: Decimal, merchant: str, entry_id: str, txn_id: str) -> None:
-    """Send a notification with custom action buttons."""
-    image_url = f"/api/wallet_autopay/qr/{txn_id}.png"
-    actions = [
-        {"action": f"{ACTION_PAY_NOW}::{entry_id}::{txn_id}", "title": "Jetzt bezahlen"},
-        {"action": f"{ACTION_ADD_TODO}::{entry_id}::{txn_id}", "title": "Später (To-Do)"}
-    ]
+async def async_send_payment_notification(hass: HomeAssistant, notify_service: str, amount: Decimal, merchant: str, entry_id: str, txn_id: str, force_full: bool = False) -> None:
+    """Send a notification with custom action buttons or simple notice for todo_only."""
+    config_entry = hass.config_entries.async_get_entry(entry_id)
+    opts = config_entry.options if config_entry.options else config_entry.data
+    todo_only = opts.get(CONF_TODO_ONLY, False)
+
+    if todo_only and not force_full:
+        msg_template = await async_get_localized_string(hass, "todo_only_message")
+        message = msg_template.format(amount=amount, merchant=merchant)
+        data = {"importance": "high", "priority": "high", "ttl": 0}
+    else:
+        msg_template = await async_get_localized_string(hass, "payment_notification_message")
+        message = msg_template.format(amount=amount, merchant=merchant)
+        image_url = f"/api/wallet_autopay/qr/{txn_id}.png"
+        
+        pay_now_title = await async_get_localized_string(hass, "pay_now")
+        pay_later_title = await async_get_localized_string(hass, "pay_later")
+        
+        actions = [
+            {"action": f"{ACTION_PAY_NOW}::{entry_id}::{txn_id}", "title": pay_now_title},
+            {"action": f"{ACTION_ADD_TODO}::{entry_id}::{txn_id}", "title": pay_later_title}
+        ]
+        data = {"image": image_url, "actions": actions, "importance": "high", "priority": "high", "ttl": 0}
+
     await hass.services.async_call(NOTIFY_DOMAIN, notify_service, {
-        "message": f"Wallet: {amount}€ bei {merchant}. Banking App mit QR-Code öffnen?",
+        "message": message,
         "title": "Wallet Auto-Pay",
-        "data": {"image": image_url, "actions": actions, "importance": "high", "priority": "high", "ttl": 0},
+        "data": data,
     })
 
 
@@ -169,11 +196,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if match:
             amount, merchant = Decimal(match.group(1).replace(",", ".")), match.group(2).strip()
             txn_id = uuid.uuid4().hex
-            hass.data[DOMAIN]["entries"][entry.entry_id]["pending"][txn_id] = {"amount": amount, "merchant": merchant, "recipient": entry.data[CONF_RECIPIENT_NAME], "iban": entry.data[CONF_TARGET_IBAN]}
-            async def _fallback(_now):
-                pending = hass.data[DOMAIN]["entries"][entry.entry_id]["pending"].pop(txn_id, None)
-                if pending: await async_add_to_todo(hass, entry.entry_id, pending["amount"], pending["merchant"])
-            async_call_later(hass, DEFAULT_FALLBACK_TIMEOUT, _fallback)
+            
+            opts = entry.options if entry.options else entry.data
+            todo_only = opts.get(CONF_TODO_ONLY, False)
+            
+            hass.data[DOMAIN]["entries"][entry.entry_id]["pending"][txn_id] = {
+                "amount": amount, 
+                "merchant": merchant, 
+                "recipient": opts.get(CONF_RECIPIENT_NAME, ""), 
+                "iban": opts.get(CONF_TARGET_IBAN, "")
+            }
+
+            if todo_only:
+                # Add to todo immediately and clear pending
+                await async_add_to_todo(hass, entry.entry_id, amount, merchant)
+                hass.data[DOMAIN]["entries"][entry.entry_id]["pending"].pop(txn_id, None)
+            else:
+                async def _fallback(_now):
+                    pending = hass.data[DOMAIN]["entries"][entry.entry_id]["pending"].pop(txn_id, None)
+                    if pending: await async_add_to_todo(hass, entry.entry_id, pending["amount"], pending["merchant"])
+                async_call_later(hass, DEFAULT_FALLBACK_TIMEOUT, _fallback)
+            
             await async_send_payment_notification(hass, notify_service, amount, merchant, entry.entry_id, txn_id)
 
     hass.data[DOMAIN]["entries"][entry.entry_id]["listeners"].append(async_track_state_change_event(hass, notification_sensor, _handle_state_change))
@@ -201,7 +244,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if target_id in hass.data[DOMAIN]["entries"]:
             txn_id = uuid.uuid4().hex
             t_entry = hass.config_entries.async_get_entry(target_id)
-            hass.data[DOMAIN]["entries"][target_id]["pending"][txn_id] = {"amount": call.data["amount"], "merchant": call.data["merchant"], "recipient": t_entry.data[CONF_RECIPIENT_NAME], "iban": t_entry.data[CONF_TARGET_IBAN]}
+            t_opts = t_entry.options if t_entry.options else t_entry.data
+            
+            hass.data[DOMAIN]["entries"][target_id]["pending"][txn_id] = {
+                "amount": call.data["amount"], 
+                "merchant": call.data["merchant"], 
+                "recipient": t_opts.get(CONF_RECIPIENT_NAME, ""), 
+                "iban": t_opts.get(CONF_TARGET_IBAN, "")
+            }
+            
+            if t_opts.get(CONF_TODO_ONLY):
+                await async_add_to_todo(hass, target_id, call.data["amount"], call.data["merchant"])
+                hass.data[DOMAIN]["entries"][target_id]["pending"].pop(txn_id, None)
+
             await async_send_payment_notification(hass, hass.data[DOMAIN]["entries"][target_id]["notify"], call.data["amount"], call.data["merchant"], target_id, txn_id)
 
     async def handle_pay_todo_item(call: ServiceCall) -> None:
@@ -212,19 +267,106 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if entity_entry and entity_entry.config_entry_id:
                 txn_id = uuid.uuid4().hex
                 t_entry = hass.config_entries.async_get_entry(entity_entry.config_entry_id)
-                hass.data[DOMAIN]["entries"][t_entry.entry_id]["pending"][txn_id] = {"amount": amount, "merchant": merchant, "recipient": t_entry.data[CONF_RECIPIENT_NAME], "iban": t_entry.data[CONF_TARGET_IBAN]}
+                t_opts = t_entry.options if t_entry.options else t_entry.data
+                
+                hass.data[DOMAIN]["entries"][t_entry.entry_id]["pending"][txn_id] = {
+                    "amount": amount, 
+                    "merchant": merchant, 
+                    "recipient": t_opts.get(CONF_RECIPIENT_NAME, ""), 
+                    "iban": t_opts.get(CONF_TARGET_IBAN, "")
+                }
+                
+                # Manual trigger from TODO item should probably always show notification even if todo_only is set, 
+                # but let's follow the setting for consistency.
+                if t_opts.get(CONF_TODO_ONLY):
+                    # It's already in a todo list (ostensibly), but adding it again if that's what's requested
+                    await async_add_to_todo(hass, t_entry.entry_id, amount, merchant)
+                    hass.data[DOMAIN]["entries"][t_entry.entry_id]["pending"].pop(txn_id, None)
+
                 await async_send_payment_notification(hass, hass.data[DOMAIN]["entries"][t_entry.entry_id]["notify"], amount, merchant, t_entry.entry_id, txn_id)
 
     async def handle_pay_next_item(call: ServiceCall) -> None:
         component = hass.data.get("todo")
-        if component:
-            todo_list = component.get_entity(call.data["entity_id"])
-            if todo_list and todo_list.todo_items:
-                await handle_pay_todo_item(ServiceCall(DOMAIN, "pay_todo_item", {"entity_id": call.data["entity_id"], "item_name": todo_list.todo_items[0].summary}))
+        if not component:
+            return
+            
+        todo_list = component.get_entity(call.data["entity_id"])
+        if not todo_list or not todo_list.todo_items:
+            # Send notification that nothing is left to pay
+            entity_entry = er.async_get(hass).async_get(call.data["entity_id"])
+            if entity_entry and entity_entry.config_entry_id:
+                notify_service = hass.data[DOMAIN]["entries"][entity_entry.config_entry_id]["notify"]
+                msg = await async_get_localized_string(hass, "no_items_to_pay")
+                await hass.services.async_call(NOTIFY_DOMAIN, notify_service, {
+                    "message": msg,
+                    "title": "Wallet Auto-Pay",
+                })
+            return
+
+        item = todo_list.todo_items[0]
+        match = re.search(r"Pay\s+(\d+(?:[.,]\d{1,2})?)€\s+for\s+(.+)", item.summary, re.I)
+        if match:
+            amount, merchant = Decimal(match.group(1).replace(",", ".")), match.group(2).strip()
+            entity_entry = er.async_get(hass).async_get(call.data["entity_id"])
+            if entity_entry and entity_entry.config_entry_id:
+                txn_id = uuid.uuid4().hex
+                t_entry = hass.config_entries.async_get_entry(entity_entry.config_entry_id)
+                t_opts = t_entry.options if t_entry.options else t_entry.data
+                
+                # Store in pending so the image view can serve it
+                hass.data[DOMAIN]["entries"][t_entry.entry_id]["pending"][txn_id] = {
+                    "amount": amount, 
+                    "merchant": merchant, 
+                    "recipient": t_opts.get(CONF_RECIPIENT_NAME, ""), 
+                    "iban": t_opts.get(CONF_TARGET_IBAN, "")
+                }
+                
+                # Remove from todo list immediately
+                await todo_list.async_delete_todo_items([item.uid])
+                
+                # Show QR code in Persistent Notification (HA UI)
+                image_url = f"/api/wallet_autopay/qr/{txn_id}.png"
+                msg_template = await async_get_localized_string(hass, "payment_notification_message")
+                message = msg_template.format(amount=amount, merchant=merchant)
+                
+                # Using Markdown for image display in persistent notification
+                markdown_msg = f"![GiroCode]({image_url})\n\n{message}\n\n**Empfänger:** {t_opts.get(CONF_RECIPIENT_NAME)}\n**IBAN:** {t_opts.get(CONF_TARGET_IBAN)}"
+                
+                await hass.services.async_call("persistent_notification", "create", {
+                    "title": "Wallet Auto-Pay: QR-Code",
+                    "message": markdown_msg,
+                    "notification_id": f"{DOMAIN}_pay_next_{t_entry.entry_id}"
+                })
+
+    async def handle_trigger_payment_notification(call: ServiceCall) -> None:
+        target_id = call.data.get("entry_id", entry.entry_id)
+        if target_id in hass.data[DOMAIN]["entries"]:
+            txn_id = uuid.uuid4().hex
+            t_entry = hass.config_entries.async_get_entry(target_id)
+            t_opts = t_entry.options if t_entry.options else t_entry.data
+            
+            hass.data[DOMAIN]["entries"][target_id]["pending"][txn_id] = {
+                "amount": call.data["amount"], 
+                "merchant": call.data["merchant"], 
+                "recipient": t_opts.get(CONF_RECIPIENT_NAME, ""), 
+                "iban": t_opts.get(CONF_TARGET_IBAN, "")
+            }
+            
+            # Force full notification regardless of todo_only setting
+            await async_send_payment_notification(
+                hass, 
+                hass.data[DOMAIN]["entries"][target_id]["notify"], 
+                call.data["amount"], 
+                call.data["merchant"], 
+                target_id, 
+                txn_id,
+                force_full=True
+            )
 
     hass.services.async_register(DOMAIN, "pay_transaction", handle_pay_transaction, schema=SERVICE_PAY_TRANSACTION_SCHEMA)
     hass.services.async_register(DOMAIN, "pay_todo_item", handle_pay_todo_item, schema=SERVICE_PAY_TODO_ITEM_SCHEMA)
     hass.services.async_register(DOMAIN, "pay_next_item", handle_pay_next_item, schema=SERVICE_PAY_NEXT_ITEM_SCHEMA)
+    hass.services.async_register(DOMAIN, "trigger_payment_notification", handle_trigger_payment_notification, schema=SERVICE_PAY_TRANSACTION_SCHEMA)
     return True
 
 

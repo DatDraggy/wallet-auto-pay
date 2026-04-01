@@ -5,6 +5,7 @@ CONF_DEVICE_ID = "device_id"
 CONF_TARGET_IBAN = "target_iban"
 CONF_RECIPIENT_NAME = "recipient_name"
 CONF_PACKAGE = "package"
+CONF_TODO_ONLY = "todo_only"
 
 # We keep the old action names for internal consistency but the logic changes
 ACTION_PAY_NOW = "WALLET_PAY"

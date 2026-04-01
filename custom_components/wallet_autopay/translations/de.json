@@ -8,17 +8,55 @@
           "device_id": "Mobilgerät",
           "target_iban": "Ziel-IBAN (Kreditkarte)",
           "recipient_name": "Name des Empfängers (wie auf dem Bankkonto)",
-          "package": "Banking App Paketname (Optional, z.B. de.fiduciagad.direkt1822.banking)"
-        }
-      }
-    },
-    "error": {
-      "cannot_connect": "Verbindung fehlgeschlagen",
-      "invalid_auth": "Ungültige Konfiguration",
-      "unknown": "Unerwarteter Fehler"
-    },
-    "abort": {
-      "already_configured": "Gerät ist bereits konfiguriert"
-    }
-  }
-}
+          "package": "Banking App Paketname (Optional, z.B. de.fiduciagad.direkt1822.banking)",
+          "todo_only": "Nur ToDo (App unterstützt keine Bildfreigabe)"
+          }
+          }
+          },
+          "error": {
+            "cannot_connect": "Verbindung fehlgeschlagen",
+            "invalid_auth": "Ungültige Konfiguration",
+            "unknown": "Unerwarteter Fehler"
+          },
+          "abort": {
+            "already_configured": "Gerät ist bereits konfiguriert"
+          }
+          },
+          "notify": {
+          "todo_only_message": "Wallet: {amount}€ bei {merchant}. Zur To-Do-Liste für manuelle Verarbeitung hinzugefügt.",
+          "payment_notification_message": "Wallet: {amount}€ bei {merchant}. Banking App mit QR-Code öffnen?",
+          "pay_now": "Jetzt bezahlen",
+          "pay_later": "Später (To-Do)",
+          "no_items_to_pay": "Keine Einträge in der To-Do-Liste zum Bezahlen."
+          },
+          "services": {
+          "pay_next_item": {
+            "name": "Nächsten Eintrag bezahlen",
+            "description": "Zeigt den QR-Code für den nächsten Eintrag in der To-Do-Liste an und markiert ihn als erledigt.",
+            "fields": {
+              "entity_id": {
+                "name": "Entitäts-ID",
+                "description": "Die ID der To-Do-Listen-Entität."
+              }
+            }
+          },
+          "trigger_payment_notification": {
+            "name": "Zahlungsbenachrichtigung auslösen",
+            "description": "Sendet manuell die vollständige interaktive Zahlungsbenachrichtigung (QR-Code + Buttons) an das Mobilgerät.",
+            "fields": {
+              "amount": {
+                "name": "Betrag",
+                "description": "Der Zahlungsbetrag."
+              },
+              "merchant": {
+                "name": "Händler",
+                "description": "Der Name des Händlers."
+              },
+              "entry_id": {
+                "name": "Eintrags-ID",
+                "description": "Optional: Spezifische Integrations-Eintrags-ID."
+              }
+            }
+          }
+          }
+          }
