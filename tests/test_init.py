@@ -163,6 +163,27 @@ async def test_notification_listener_and_todo_fallback(hass: HomeAssistant) -> N
         assert "Pay 12.34€ for Starbucks" in todo_calls[0][0][2]["item"]
 
 
+async def test_notification_listener_actual_payment(hass: HomeAssistant) -> None:
+    """Test actual payment notification format from Google Wallet."""
+    real_device_id = await setup_mock_registries(hass)
+    config = MOCK_CONFIG.copy()
+    config[CONF_DEVICE_ID] = real_device_id
+    entry = MockConfigEntry(domain=DOMAIN, data=config, entry_id="test_entry")
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    sensor_id = hass.data[DOMAIN][entry.entry_id]["sensor"]
+
+    with patch("homeassistant.core.ServiceRegistry.async_call") as mock_call:
+        hass.states.async_set(sensor_id, "Notification", {"package": "com.google.android.apps.walletnfcrel", "android.title": "Bakery", "android.text": "1,00 € mit Visa"})
+        await hass.async_block_till_done()
+        notify_calls = [c for c in mock_call.call_args_list if c[0][0] == "notify"]
+        assert len(notify_calls) > 0
+        assert "1.00" in notify_calls[0][0][2]["message"]
+        assert "Bakery" in notify_calls[0][0][2]["message"]
+
+
 async def test_async_add_to_todo_with_registry(hass: HomeAssistant) -> None:
     """Test async_add_to_todo with entity in registry."""
     entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test_entry")

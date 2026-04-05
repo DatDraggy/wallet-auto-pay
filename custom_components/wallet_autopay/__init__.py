@@ -192,32 +192,48 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         new_state = event.data.get("new_state")
         if not new_state or new_state.attributes.get("package") != "com.google.android.apps.walletnfcrel": return
         text = new_state.attributes.get("android.text", "")
-        match = re.search(r"(?:€|EUR)?\s*(\d+(?:[.,]\d{1,2})?)\s*(?:€|EUR)?\s*(?:at|bei)\s+(.+)", text, re.I)
-        if match:
-            amount, merchant = Decimal(match.group(1).replace(",", ".")), match.group(2).strip()
-            txn_id = uuid.uuid4().hex
+        title = new_state.attributes.get("android.title", "")
+        
+        # In Google Wallet, for standard payment text is "Paid € 12.34 at Starbucks"
+        # For actual payments the title might be the vendor and text "1,00 € mit {payment method}"
+        
+        amount_match = re.search(r"(?:€|EUR)?\s*(\d+(?:[.,]\d{1,2})?)\s*(?:€|EUR)?", text, re.I)
+        merchant_match = re.search(r"(?:at|bei)\s+(.+)", text, re.I)
+        
+        if amount_match:
+            amount_str = amount_match.group(1).replace(",", ".")
+            amount = Decimal(amount_str)
             
-            opts = entry.options if entry.options else entry.data
-            todo_only = opts.get(CONF_TODO_ONLY, False)
-            
-            hass.data[DOMAIN]["entries"][entry.entry_id]["pending"][txn_id] = {
-                "amount": amount, 
-                "merchant": merchant, 
-                "recipient": opts.get(CONF_RECIPIENT_NAME, ""), 
-                "iban": opts.get(CONF_TARGET_IBAN, "")
-            }
+            merchant = ""
+            if merchant_match:
+                merchant = merchant_match.group(1).strip()
+            elif title:
+                merchant = title.strip()
+                
+            if merchant:
+                txn_id = uuid.uuid4().hex
+                
+                opts = entry.options if entry.options else entry.data
+                todo_only = opts.get(CONF_TODO_ONLY, False)
+                
+                hass.data[DOMAIN]["entries"][entry.entry_id]["pending"][txn_id] = {
+                    "amount": amount, 
+                    "merchant": merchant, 
+                    "recipient": opts.get(CONF_RECIPIENT_NAME, ""), 
+                    "iban": opts.get(CONF_TARGET_IBAN, "")
+                }
 
-            if todo_only:
-                # Add to todo immediately and clear pending
-                await async_add_to_todo(hass, entry.entry_id, amount, merchant)
-                hass.data[DOMAIN]["entries"][entry.entry_id]["pending"].pop(txn_id, None)
-            else:
-                async def _fallback(_now):
-                    pending = hass.data[DOMAIN]["entries"][entry.entry_id]["pending"].pop(txn_id, None)
-                    if pending: await async_add_to_todo(hass, entry.entry_id, pending["amount"], pending["merchant"])
-                async_call_later(hass, DEFAULT_FALLBACK_TIMEOUT, _fallback)
-            
-            await async_send_payment_notification(hass, notify_service, amount, merchant, entry.entry_id, txn_id)
+                if todo_only:
+                    # Add to todo immediately and clear pending
+                    await async_add_to_todo(hass, entry.entry_id, amount, merchant)
+                    hass.data[DOMAIN]["entries"][entry.entry_id]["pending"].pop(txn_id, None)
+                else:
+                    async def _fallback(_now):
+                        pending = hass.data[DOMAIN]["entries"][entry.entry_id]["pending"].pop(txn_id, None)
+                        if pending: await async_add_to_todo(hass, entry.entry_id, pending["amount"], pending["merchant"])
+                    async_call_later(hass, DEFAULT_FALLBACK_TIMEOUT, _fallback)
+                
+                await async_send_payment_notification(hass, notify_service, amount, merchant, entry.entry_id, txn_id)
 
     hass.data[DOMAIN]["entries"][entry.entry_id]["listeners"].append(async_track_state_change_event(hass, notification_sensor, _handle_state_change))
 
